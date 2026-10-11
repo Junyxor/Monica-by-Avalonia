@@ -17,6 +17,47 @@ namespace Monica.Tests;
 
 public sealed class DevicePasswordSyncTests
 {
+    [Theory]
+    [InlineData(PasskeyAlgorithm.Es256)]
+    [InlineData(PasskeyAlgorithm.Rs256)]
+    [InlineData(PasskeyAlgorithm.Ps256)]
+    public async Task Native_reference_update_preserves_private_key_across_public_encodings(int algorithm)
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var material = PasskeyKeyMaterialGenerator.Generate(algorithm == PasskeyAlgorithm.Ps256 ? PasskeyAlgorithm.Rs256 : algorithm);
+        var keyId = Guid.NewGuid().ToString();
+        var entry = new PasskeyEntry { CredentialId = Guid.NewGuid().ToString(), RpId = "example.test", RpName = "Native reference key",
+            UserId = "Zml4dHVyZQ==", PublicKeyAlgorithm = algorithm, PublicKey = material.PublicKeySpkiBase64 };
+        var bridge = new MdbxUniffiNativeBridge();
+        using (var vault = await bridge.OpenVaultAsync(fixture.Database.FilePath, fixture.Database.EncryptedPassword!, "reference-fixture"))
+        {
+            var access = (IMdbxNativeDevicePasswordAccess)vault;
+            await access.EnsureDeviceSyncFoldersAsync(new JsonArray(), CancellationToken.None);
+            var root = (await access.ListDeviceSyncProjectsAsync(CancellationToken.None)).Single(p => MdbxAndroidRoot.IsRootTitle(p.Title));
+            await access.CreateDeviceSyncEntryAsync(keyId, root.ProjectId, "passkey", "Native reference key",
+                DevicePasskeyShape.Export(entry, material.PrivateKeyPkcs8Base64)["payload"]!.ToJsonString(), CancellationToken.None);
+        }
+        var before = Assert.Single((await fixture.Vaults.ReadDevicePasswordsAsync(fixture.Database, CancellationToken.None))
+            .Where(s => s.Data["entry_type"]?.GetValue<string>() == "passkey"));
+        var reference = before.Data.DeepClone().AsObject();
+        reference["payload"]!["private_key_alias"] = "";
+        reference["payload"]!["key_status"] = "reference";
+        reference["payload"]!["public_key"] = material.PublicKeySpkiBase64;
+        reference["payload"]!["notes"] = "Reference metadata update";
+        Assert.NotNull(await fixture.Vaults.TryApplyDevicePasswordAsync(fixture.Database, before.GlobalId, before.LocalId,
+            before.Guard, false, reference, CancellationToken.None));
+        using (var vault = await bridge.OpenVaultAsync(fixture.Database.FilePath, fixture.Database.EncryptedPassword!, "reference-fixture"))
+        {
+            var access = (IMdbxNativeDevicePasswordAccess)vault;
+            var summary = (await access.GetDeviceSyncSummaryAsync(keyId, CancellationToken.None))!;
+            var current = (await access.ReadDeviceSyncObjectAsync(summary, CancellationToken.None))!;
+            var payload = JsonNode.Parse(current.PayloadJson)!;
+            Assert.Equal(material.PrivateKeyPkcs8Base64, payload["private_key_alias"]!.GetValue<string>());
+            Assert.Equal("reference", payload["key_status"]!.GetValue<string>());
+            Assert.Equal("Reference metadata update", payload["notes"]!.GetValue<string>());
+        }
+    }
+
     [Fact]
     public async Task Root_tags_and_native_passkey_relations_restore_live_credential_store_and_delete()
     {

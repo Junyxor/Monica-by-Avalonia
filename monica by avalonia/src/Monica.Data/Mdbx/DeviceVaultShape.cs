@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Security.Cryptography;
+using Monica.Core.Passkeys;
 
 namespace Monica.Data.Mdbx;
 
@@ -167,10 +169,63 @@ public static class DeviceVaultShape
         Validate(data);
         if (data["entry_type"]!.GetValue<string>() is "login" or "ssh-key") return DevicePasswordShape.Apply(data, existing, id, folder);
         var payload = data["payload"]!.DeepClone().AsObject();
+        if (data["entry_type"]!.GetValue<string>() == "passkey" && existing is not null)
+            PreservePasskeyKey(payload, JsonNode.Parse(existing)!.AsObject());
         foreach (var key in LocalFields) payload.Remove(key);
         payload["monica_entry_id"] = id;
         payload["room_id"] = MdbxStableId.FromString(data["entry_type"]!.GetValue<string>(), id);
         payload["mdbx_folder_id"] = folder;
         return payload;
+    }
+
+    private static void PreservePasskeyKey(JsonObject incoming, JsonObject previous)
+    {
+        string Text(JsonObject value, string field) => value[field]?.GetValue<string>() ?? "";
+        var oldKey = Text(previous, "private_key_alias");
+        var oldPublic = Text(previous, "public_key");
+        if (oldKey.Length == 0 && oldPublic.Length == 0) return;
+        var algorithm = incoming["public_key_algorithm"]!.GetValue<int>();
+        if (previous["public_key_algorithm"] is JsonValue number && number.TryGetValue<int>(out var oldAlgorithm) && oldAlgorithm != algorithm)
+            throw new InvalidDataException("passkey_conflict");
+        var credential = Text(previous, "credential_id");
+        var rp = Text(previous, "rp_id");
+        if ((credential.Length > 0 && PasskeyCredentialId.Normalize(credential) != PasskeyCredentialId.Normalize(Text(incoming, "credential_id"))) ||
+            (rp.Length > 0 && !rp.Equals(Text(incoming, "rp_id"), StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("passkey_conflict");
+        try
+        {
+            byte[] Canonical(string encoded)
+            {
+                var bytes = Convert.FromBase64String(encoded);
+                if (PasskeyKeyMaterialGenerator.TryParseCosePublicKey(bytes, out var cose, out var consumed) && consumed == bytes.Length)
+                {
+                    if (cose!.Algorithm != algorithm) throw new InvalidDataException("passkey_conflict");
+                    encoded = cose.ToSubjectPublicKeyInfoBase64();
+                }
+                return PasskeyKeyMaterialGenerator.BuildCosePublicKey(algorithm, encoded);
+            }
+            if (oldPublic.Length > 0)
+            {
+                if (!CryptographicOperations.FixedTimeEquals(Canonical(oldPublic), Canonical(Text(incoming, "public_key"))))
+                    throw new InvalidDataException("passkey_conflict");
+            }
+            else
+            {
+                var publicBytes = Canonical(Text(incoming, "public_key"));
+                if (!PasskeyKeyMaterialGenerator.TryParseCosePublicKey(publicBytes, out var parsed, out _))
+                    throw new InvalidDataException("passkey_conflict");
+                var challenge = RandomNumberGenerator.GetBytes(32);
+                var signature = PasskeyKeyMaterialGenerator.Sign(algorithm, oldKey, challenge);
+                if (!PasskeyKeyMaterialGenerator.Verify(algorithm, parsed!.ToSubjectPublicKeyInfoBase64(), challenge, signature))
+                    throw new InvalidDataException("passkey_conflict");
+            }
+        }
+        catch (Exception error) when (error is CryptographicException or FormatException or ArgumentException or NotSupportedException)
+        {
+            throw new InvalidDataException("passkey_conflict");
+        }
+        // A metadata-only reference cannot erase the local private key or claim a new backup.
+        if (Text(incoming, "private_key_alias").Length == 0 && oldKey.Length > 0)
+            incoming["private_key_alias"] = oldKey;
     }
 }
