@@ -34,8 +34,10 @@ public sealed class DevicePasswordSyncTests
             var access = (IMdbxNativeDevicePasswordAccess)vault;
             await access.EnsureDeviceSyncFoldersAsync(new JsonArray(), CancellationToken.None);
             var root = (await access.ListDeviceSyncProjectsAsync(CancellationToken.None)).Single(p => MdbxAndroidRoot.IsRootTitle(p.Title));
+            var originalPayload = DevicePasskeyShape.Export(entry, material.PrivateKeyPkcs8Base64)["payload"]!.AsObject();
+            originalPayload["backup_eligible"] = false; originalPayload["backup_state"] = false;
             await access.CreateDeviceSyncEntryAsync(keyId, root.ProjectId, "passkey", "Native reference key",
-                DevicePasskeyShape.Export(entry, material.PrivateKeyPkcs8Base64)["payload"]!.ToJsonString(), CancellationToken.None);
+                originalPayload.ToJsonString(), CancellationToken.None);
         }
         var before = Assert.Single((await fixture.Vaults.ReadDevicePasswordsAsync(fixture.Database, CancellationToken.None))
             .Where(s => s.Data["entry_type"]?.GetValue<string>() == "passkey"));
@@ -44,6 +46,7 @@ public sealed class DevicePasswordSyncTests
         reference["payload"]!["key_status"] = "reference";
         reference["payload"]!["public_key"] = material.PublicKeySpkiBase64;
         reference["payload"]!["notes"] = "Reference metadata update";
+        reference["payload"]!.AsObject().Remove("backup_eligible"); reference["payload"]!.AsObject().Remove("backup_state");
         Assert.NotNull(await fixture.Vaults.TryApplyDevicePasswordAsync(fixture.Database, before.GlobalId, before.LocalId,
             before.Guard, false, reference, CancellationToken.None));
         using (var vault = await bridge.OpenVaultAsync(fixture.Database.FilePath, fixture.Database.EncryptedPassword!, "reference-fixture"))
@@ -55,6 +58,8 @@ public sealed class DevicePasswordSyncTests
             Assert.Equal(material.PrivateKeyPkcs8Base64, payload["private_key_alias"]!.GetValue<string>());
             Assert.Equal("reference", payload["key_status"]!.GetValue<string>());
             Assert.Equal("Reference metadata update", payload["notes"]!.GetValue<string>());
+            Assert.False(payload["backup_eligible"]!.GetValue<bool>());
+            Assert.False(payload["backup_state"]!.GetValue<bool>());
         }
     }
 

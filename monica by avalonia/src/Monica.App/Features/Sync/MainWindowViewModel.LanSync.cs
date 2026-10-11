@@ -18,6 +18,7 @@ public sealed record LanPeerDisplay(string Name, string Address, int Port)
 }
 
 public sealed record DeviceSyncFrequencyChoice(int Seconds, string Label);
+public sealed record DeviceSyncModeChoice(DeviceSyncMode Mode, string Label);
 
 public sealed partial class DeviceSyncPeerDisplay(string deviceId) : ObservableObject
 {
@@ -50,11 +51,14 @@ public sealed partial class MainWindowViewModel
     [ObservableProperty] private bool _lanProgressIndeterminate = true;
     [ObservableProperty] private bool _deviceSyncEnabled = true;
     [ObservableProperty] private DeviceSyncFrequencyChoice? _selectedDeviceSyncFrequency;
+    [ObservableProperty] private DeviceSyncModeChoice? _selectedDeviceSyncMode;
+    [ObservableProperty] private bool _isDeviceSyncPairing;
     [ObservableProperty] private bool _isCustomDeviceSyncInterval;
     [ObservableProperty] private string _deviceSyncCustomMinutes = "10";
     public ObservableCollection<LanPeerDisplay> LanPeers { get; } = [];
     public ObservableCollection<string> LanHostLinks { get; } = [];
     public ObservableCollection<DeviceSyncFrequencyChoice> DeviceSyncFrequencies { get; } = [];
+    public ObservableCollection<DeviceSyncModeChoice> DeviceSyncModes { get; } = [];
     public ObservableCollection<DeviceSyncPeerDisplay> SyncedDevices { get; } = [];
 
     private void InitializeDeviceSync(DeviceSyncCoordinator? coordinator)
@@ -84,6 +88,11 @@ public sealed partial class MainWindowViewModel
         try
         {
             DeviceSyncFrequencies.Clear();
+            DeviceSyncModes.Clear();
+            DeviceSyncModes.Add(new(DeviceSyncMode.Bidirectional, L.Get("DeviceSyncBidirectional")));
+            DeviceSyncModes.Add(new(DeviceSyncMode.SendOnly, L.Get("DeviceSyncSendOnly")));
+            DeviceSyncModes.Add(new(DeviceSyncMode.ReceiveOnly, L.Get("DeviceSyncReceiveOnly")));
+            SelectedDeviceSyncMode = DeviceSyncModes.First(item => item.Mode == (_deviceSync?.State.Mode ?? DeviceSyncMode.Bidirectional));
             foreach (var seconds in new[] { 0, 60, 300, 900, 1800, -1 })
                 DeviceSyncFrequencies.Add(new(seconds, seconds == 0 ? L.Get("DeviceSyncRealtime") :
                     seconds == -1 ? L.Get("DeviceSyncCustom") : L.Format("DeviceSyncEveryMinutes", seconds / 60)));
@@ -101,6 +110,8 @@ public sealed partial class MainWindowViewModel
         try
         {
             DeviceSyncEnabled = state.Enabled;
+            IsDeviceSyncPairing = state.Pairing;
+            SelectedDeviceSyncMode = DeviceSyncModes.First(item => item.Mode == state.Mode);
             if (_displayedDeviceSyncInterval != state.IntervalSeconds || SelectedDeviceSyncFrequency is null)
             {
                 _displayedDeviceSyncInterval = state.IntervalSeconds;
@@ -117,7 +128,8 @@ public sealed partial class MainWindowViewModel
                 display.Status = L.Get(peer.Status switch
                 {
                     "syncing" => "DeviceSyncSyncing", "online" => "DeviceSyncOnline", "scheduled" => "DeviceSyncScheduled", "paused" => "DeviceSyncPaused",
-                    "locked" => "DeviceSyncLocked", "waiting" => "DeviceSyncWaiting", _ => "DeviceSyncOffline"
+                    "locked" => "DeviceSyncLocked", "waiting" => "DeviceSyncWaiting", "first_sync_pending" => "DeviceSyncFirstPending",
+                    "preparation_failed" => "DeviceSyncPreparationFailed", _ => "DeviceSyncOffline"
                 });
                 display.LastSynced = peer.LastSyncedAt is { } time ? L.Format("DeviceSyncLast", time.ToLocalTime().ToString("g")) : "";
             }
@@ -148,6 +160,7 @@ public sealed partial class MainWindowViewModel
             LanDiagnosticText = state.Error is null ? "" : L.Format("DeviceSyncDiagnosticFormat", state.FailureStage, state.Error,
                 state.FailureKind, state.ConnectionAttempts, string.IsNullOrEmpty(state.FailureOperation) ? "-" : state.FailureOperation,
                 state.FailureRequestBytes);
+            if (state.Error is not null) LanDiagnosticText = L.Format("DeviceSyncDirectionDiagnostic", state.Mode.ToWire()) + Environment.NewLine + LanDiagnosticText;
             if (state.Phase is "locked" or "completed") { LanInvitation = ""; LanPairingCode = ""; }
         }
         finally { _applyingDeviceSyncState = false; }
@@ -156,6 +169,12 @@ public sealed partial class MainWindowViewModel
     partial void OnDeviceSyncEnabledChanged(bool value)
     {
         if (!_applyingDeviceSyncState && _deviceSync is not null) _ = RunDeviceActionAsync(() => _deviceSync.SetEnabledAsync(value));
+    }
+
+    partial void OnSelectedDeviceSyncModeChanged(DeviceSyncModeChoice? value)
+    {
+        if (!_applyingDeviceSyncState && value is not null && _deviceSync is not null)
+            _ = RunDeviceActionAsync(() => _deviceSync.SetModeAsync(value.Mode));
     }
 
     partial void OnSelectedDeviceSyncFrequencyChanged(DeviceSyncFrequencyChoice? value)
@@ -284,6 +303,8 @@ public sealed partial class MainWindowViewModel
         "unsupported_protocol" or "invalid_invitation" => "DeviceSyncQrInvalid",
         "pairing_expired" => "LanExpired", "same_device" => "DeviceSyncSameDevice", "too_many_devices" => "DeviceSyncLimit",
         "invalid_password_payload" or "invalid_record" => "DeviceSyncInvalidData",
+        "sync_direction_conflict" => "DeviceSyncDirectionConflict",
+        "sync_direction_unsupported" => "DeviceSyncDirectionUnsupported",
         "request_too_large" => "DeviceSyncRequestTooLarge",
         _ when error.StartsWith("storage_", StringComparison.Ordinal) => "DeviceSyncStorageFailed",
         _ when stage == "preparing" => "DeviceSyncPrepareFailed",

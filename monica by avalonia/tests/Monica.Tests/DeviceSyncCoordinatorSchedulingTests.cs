@@ -9,6 +9,125 @@ namespace Monica.Tests;
 
 public sealed class DeviceSyncCoordinatorSchedulingTests
 {
+    [Theory]
+    [InlineData(DeviceSyncMode.Bidirectional, 1)]
+    [InlineData(DeviceSyncMode.SendOnly, 0)]
+    [InlineData(DeviceSyncMode.ReceiveOnly, 1)]
+    public async Task Direction_controls_source_export_and_destination_apply(DeviceSyncMode mode, int applies)
+    {
+        await using var fixture = await Fixture.CreateAsync(mode: mode);
+        fixture.Data.FailExports = mode == DeviceSyncMode.ReceiveOnly;
+        await fixture.CompleteRoundAsync();
+        Assert.Equal(mode, fixture.Sync.State.Mode);
+        Assert.Equal(mode.ToWire(), fixture.Network.LastStarted.GetProperty("device").GetProperty("sync_mode").GetString());
+        Assert.Equal(applies, fixture.Data.Applies);
+        Assert.NotNull(Assert.Single(fixture.Sync.State.Peers).LastSyncedAt);
+        if (mode == DeviceSyncMode.ReceiveOnly)
+        {
+            Assert.Equal(0, fixture.Data.Revisions);
+            Assert.Equal(0, fixture.Data.Prepares);
+            Assert.Equal(JsonValueKind.Null, fixture.Network.LastStarted.GetProperty("outgoing_directory").ValueKind);
+            Assert.Equal("", fixture.Network.LastStarted.GetProperty("content_key").GetString());
+        }
+        else Assert.Equal(1, fixture.Data.Prepares);
+    }
+
+    [Theory]
+    [InlineData(DeviceSyncMode.SendOnly, true)]
+    [InlineData(DeviceSyncMode.Bidirectional, false)]
+    public async Task A_round_with_no_incoming_contents_does_not_wait_for_the_edit_gate(DeviceSyncMode mode, bool received)
+    {
+        await using var fixture = await Fixture.CreateAsync(mode: mode);
+        fixture.Network.ReceiveContent = received;
+        fixture.Sync.CanApply = () => false;
+        await fixture.CompleteRoundAsync();
+        Assert.Equal("completed", fixture.Sync.State.Phase);
+        Assert.Equal(0, fixture.Data.Applies);
+    }
+
+    [Fact]
+    public async Task Changing_direction_stops_the_old_listener_and_keeps_pairing_and_frequency()
+    {
+        await using var fixture = await Fixture.CreateAsync(host: true);
+        await fixture.Sync.TickAsync();
+        var revisions = fixture.Data.Revisions;
+        var peer = Assert.Single(fixture.Sync.State.Peers);
+        await fixture.Sync.SetModeAsync(DeviceSyncMode.ReceiveOnly);
+        Assert.Equal(1, fixture.Network.Cancellations);
+        Assert.Equal(DeviceSyncMode.ReceiveOnly, fixture.Sync.State.Mode);
+        Assert.Equal(peer.DeviceId, Assert.Single(fixture.Sync.State.Peers).DeviceId);
+        Assert.Equal(300, fixture.Sync.State.IntervalSeconds);
+        fixture.Data.FailExports = true;
+        await fixture.CompleteRoundAsync();
+        Assert.Equal(2, fixture.Network.Listeners);
+        Assert.Equal(revisions, fixture.Data.Revisions);
+    }
+
+    [Fact]
+    public async Task Protected_preferences_default_old_records_to_bidirectional_and_keep_direction_on_reload()
+    {
+        var protector = new FixtureProtector();
+        var path = Path.Combine(TestTempPaths.CreateDirectoryPath(), "peers.protected");
+        var original = new DeviceSyncPreferences { DeviceId = "a", Peers = [
+            new DeviceSyncPeer { DeviceId = "z", Name = "Peer", PairId = "pair", TrustedKey = new string('A',43) }] };
+        var legacy = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(original))!.AsObject();
+        legacy.Remove("Mode");
+        await File.WriteAllTextAsync(path, await protector.ProtectAsync(legacy.ToJsonString()));
+        var store = new DeviceSyncPreferenceStore(protector, path);
+        var loaded = await store.LoadAsync();
+        Assert.Equal(DeviceSyncMode.Bidirectional, loaded.Mode);
+        foreach (var mode in Enum.GetValues<DeviceSyncMode>())
+        {
+            loaded.Mode = mode;
+            await store.SaveAsync(loaded);
+            var reloaded = await store.LoadAsync();
+            Assert.Equal(mode, reloaded.Mode);
+            Assert.Equal(original.ReplicaKey, reloaded.ReplicaKey);
+            Assert.Equal(original.Peers[0].TrustedKey, Assert.Single(reloaded.Peers).TrustedKey);
+        }
+    }
+
+    [Fact]
+    public async Task Preparation_failure_clears_completed_progress_and_keeps_existing_pairing()
+    {
+        await using var fixture = await Fixture.CreateAsync(host: true);
+        fixture.Data.ReportPreparation = true;
+        fixture.Data.FailPrepare = true;
+        var failure = new TaskCompletionSource<DeviceSyncState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Sync.Changed += (_, state) => { if (state.Error is not null) failure.TrySetResult(state); };
+        fixture.Sync.Start();
+        var state = await failure.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("invalid_passkey_material", state.Error);
+        Assert.Equal("preparing", state.FailureStage);
+        Assert.Equal("failed", state.Phase);
+        Assert.Null(state.Progress);
+        Assert.Equal("preparation_failed", Assert.Single(state.Peers).Status);
+        Assert.Equal(0, fixture.Network.Listeners);
+        fixture.Data.FailPrepare = false;
+        fixture.Time.Advance(10);
+        await fixture.Sync.TickAsync();
+        Assert.Null(fixture.Sync.State.Error);
+        Assert.Null(fixture.Sync.State.Progress);
+        Assert.Single(fixture.Sync.State.Peers);
+        Assert.Equal(1, fixture.Network.Listeners);
+    }
+
+    [Fact]
+    public async Task Prepared_listener_waits_for_first_sync_without_leaving_a_full_progress_bar()
+    {
+        await using var fixture = await Fixture.CreateAsync(host: true);
+        fixture.Data.ReportPreparation = true;
+        var waiting = new TaskCompletionSource<DeviceSyncState>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Sync.Changed += (_, state) => { if (fixture.Network.Listeners > 0) waiting.TrySetResult(state); };
+        fixture.Sync.Start();
+        var state = await waiting.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Null(state.Error);
+        Assert.Equal("idle", state.Phase);
+        Assert.Null(state.Progress);
+        Assert.Equal("first_sync_pending", Assert.Single(state.Peers).Status);
+        Assert.Null(Assert.Single(state.Peers).LastSyncedAt);
+    }
+
     [Fact]
     public async Task Interval_changes_wait_for_the_deadline_but_manual_sync_and_reconnect_catch_up()
     {
@@ -143,7 +262,7 @@ public sealed class DeviceSyncCoordinatorSchedulingTests
         public required VaultSessionService Session { get; init; }
         public required FixtureProtector Secrets { get; init; }
 
-        public static async Task<Fixture> CreateAsync(bool host = false)
+        public static async Task<Fixture> CreateAsync(bool host = false, DeviceSyncMode mode = DeviceSyncMode.Bidirectional)
         {
             var time = new FakeTime();
             var session = new VaultSessionService();
@@ -152,7 +271,7 @@ public sealed class DeviceSyncCoordinatorSchedulingTests
             var store = new DeviceSyncPreferenceStore(protector, Path.Combine(TestTempPaths.CreateDirectoryPath(), "peers.protected"));
             await store.SaveAsync(new DeviceSyncPreferences
             {
-                DeviceId = host ? "z" : "a", IntervalSeconds = 300,
+                DeviceId = host ? "z" : "a", IntervalSeconds = 300, Mode = mode,
                 Peers = [new DeviceSyncPeer { DeviceId = host ? "a" : "z", Name = "Peer", PairId = "pair", TrustedKey = new string('A', 43) }]
             });
             var data = new FakeData();
@@ -171,15 +290,30 @@ public sealed class DeviceSyncCoordinatorSchedulingTests
         public async ValueTask DisposeAsync() { await Sync.DisposeAsync(); Session.Dispose(); }
     }
 
-    private sealed class FakeData : IDeviceSyncDataProvider
+    private sealed class FakeData : IDeviceSyncDataProvider, IDeviceSyncProgressSource
     {
+        public event Action<DeviceSyncProgress>? Progress;
+        public bool ReportPreparation { get; set; }
+        public bool FailPrepare { get; set; }
+        public bool FailExports { get; set; }
+        public int Prepares { get; private set; }
+        public int Revisions { get; private set; }
         public string Revision { get; set; } = "local-1";
         public bool FailApply { get; set; }
         public int Applies { get; private set; }
         public int Pauses { get; private set; }
-        public Task<string> GetRevisionAsync(CancellationToken token) => Task.FromResult(Revision);
+        public Task<string> GetRevisionAsync(CancellationToken token)
+        {
+            Revisions++;
+            if (FailExports) throw new LanSyncException("invalid_passkey_material");
+            return Task.FromResult(Revision);
+        }
         public Task<DeviceSyncSnapshot> PrepareAsync(string directory, CancellationToken token)
         {
+            Prepares++;
+            if (FailExports) throw new LanSyncException("invalid_passkey_material");
+            if (ReportPreparation) Progress?.Invoke(new("preparing", 851, 851));
+            if (FailPrepare) throw new LanSyncException("invalid_passkey_material");
             Directory.CreateDirectory(directory);
             return Task.FromResult(new DeviceSyncSnapshot("monica-passwords-v1", Revision, directory, new string('A', 43)));
         }
@@ -207,6 +341,8 @@ public sealed class DeviceSyncCoordinatorSchedulingTests
         private ulong _next;
         public int Connections { get; private set; }
         public int Listeners { get; private set; }
+        public int Cancellations { get; private set; }
+        public bool ReceiveContent { get; set; } = true;
         public bool Offline { get; set; }
         public ulong RemoteRequest { get; set; }
         public ulong RemoteVersion { get; set; }
@@ -240,13 +376,14 @@ public sealed class DeviceSyncCoordinatorSchedulingTests
                         {
                             device_id = "z", name = "Peer", content_type = "vault", vault_content_version = 2, revision = "remote-1",
                             interval_seconds = RemoteInterval, settings_version = RemoteVersion, settings_writer = RemoteWriter,
-                            sync_request = RemoteRequest, pairing = new { content_key = new string('A', 43) }
+                            sync_request = RemoteRequest, receive_content = ReceiveContent, pairing = new { content_key = new string('A', 43) }
                         }
                     });
                 case "acknowledge":
                     _phases[input.GetProperty("handle").GetUInt64()] = input.GetProperty("success").GetBoolean() ? "completed" : "failed";
                     break;
                 case "cancel":
+                    Cancellations++;
                     _phases[input.GetProperty("handle").GetUInt64()] = "cancelled";
                     break;
                 case "release":

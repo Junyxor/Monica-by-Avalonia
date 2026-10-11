@@ -34,7 +34,8 @@ public sealed record DeviceSyncPeerState(string DeviceId, string Name, string St
 public sealed record DeviceSyncState(bool Enabled, int IntervalSeconds, IReadOnlyList<DeviceSyncPeerState> Peers,
     string Phase = "idle", string Code = "", IReadOnlyList<string>? Invitations = null, string? Error = null, bool Pairing = false,
     string FailureStage = "", int ConnectionAttempts = 0, string FailureKind = "",
-    string FailureOperation = "", int FailureRequestBytes = 0, DeviceSyncProgress? Progress = null);
+    string FailureOperation = "", int FailureRequestBytes = 0, DeviceSyncProgress? Progress = null,
+    DeviceSyncMode Mode = DeviceSyncMode.Bidirectional);
 
 /// <summary>Owns connections for the app session, independently of navigation.</summary>
 public sealed class DeviceSyncCoordinator(
@@ -74,6 +75,7 @@ public sealed class DeviceSyncCoordinator(
     private DateTimeOffset _loadAfter;
     private DeviceSyncProgress? _progress;
     private bool _progressAttached;
+    private const string ReceiveOnlyRevision = "receive-only-v1";
 
     public event EventHandler<DeviceSyncState>? Changed;
     public event EventHandler? PasswordsChanged;
@@ -109,16 +111,21 @@ public sealed class DeviceSyncCoordinator(
 
     private void Publish()
     {
-        var peers = _preferences?.Peers.Select(peer => new DeviceSyncPeerState(peer.DeviceId, peer.Name,
-            _statuses.GetValueOrDefault(peer.DeviceId, "offline"), peer.LastSyncedAt)).ToArray() ?? State.Peers;
+        var peers = _preferences?.Peers.Select(peer =>
+        {
+            var status = _statuses.GetValueOrDefault(peer.DeviceId, "offline");
+            if (_error is not null && _failureStage == "preparing") status = "preparation_failed";
+            else if (peer.LastSyncedAt is null && status is "offline" or "waiting") status = "first_sync_pending";
+            return new DeviceSyncPeerState(peer.DeviceId, peer.Name, status, peer.LastSyncedAt);
+        }).ToArray() ?? State.Peers;
         var next = new DeviceSyncState(_preferences?.Enabled ?? State.Enabled, _preferences?.IntervalSeconds ?? State.IntervalSeconds,
             peers, _phase, _code, _invitations.ToArray(), _error, _pairing, _failureStage, _connectionAttempts, _failureKind,
-            _failureOperation, _failureRequestBytes, _progress);
+            _failureOperation, _failureRequestBytes, _progress, _preferences?.Mode ?? State.Mode);
         if (State.Enabled == next.Enabled && State.IntervalSeconds == next.IntervalSeconds && State.Phase == next.Phase &&
             State.Code == next.Code && State.Error == next.Error && State.Pairing == next.Pairing && State.Peers.SequenceEqual(next.Peers) &&
             (State.Invitations ?? []).SequenceEqual(next.Invitations ?? []) && State.FailureStage == next.FailureStage &&
             State.ConnectionAttempts == next.ConnectionAttempts && State.FailureKind == next.FailureKind &&
-            State.FailureOperation == next.FailureOperation && State.FailureRequestBytes == next.FailureRequestBytes && State.Progress == next.Progress) return;
+            State.FailureOperation == next.FailureOperation && State.FailureRequestBytes == next.FailureRequestBytes && State.Progress == next.Progress && State.Mode == next.Mode) return;
         State = next;
         Changed?.Invoke(this, State);
     }
@@ -174,6 +181,30 @@ public sealed class DeviceSyncCoordinator(
             if (_transfers.Remove(deviceId, out var transfer)) await StopAsync(transfer);
             _preferences!.Peers.RemoveAll(peer => peer.DeviceId == deviceId);
             _force.Remove(deviceId); _retry.Remove(deviceId); _statuses.Remove(deviceId);
+            await store.SaveAsync(_preferences, _lifetime.Token);
+            CleanSnapshots();
+            Publish();
+        }
+        finally { _gate.Release(); }
+    }
+
+    public async Task SetModeAsync(DeviceSyncMode mode)
+    {
+        if (!Enum.IsDefined(mode)) throw new ArgumentOutOfRangeException(nameof(mode));
+        await _gate.WaitAsync(_lifetime.Token);
+        try
+        {
+            await EnsurePreferencesAsync(_lifetime.Token);
+            if (_preferences!.Mode == mode) return;
+            if (_pairing) throw new LanSyncException("device_sync_pairing_busy");
+            if (_preferences.SyncRequest >= long.MaxValue) throw new LanSyncException("device_sync_settings_limit");
+            foreach (var transfer in _transfers.Values.ToArray()) await StopAsync(transfer);
+            _transfers.Clear();
+            _preferences.Mode = mode;
+            _preferences.SyncRequest++;
+            _snapshot = null; _progress = null; _phase = "idle"; _error = null; _loadAfter = default;
+            _failureStage = ""; _failureKind = ""; _failureOperation = ""; _failureRequestBytes = 0;
+            foreach (var peer in _preferences.Peers) { _force.Add(peer.DeviceId); _retry.Remove(peer.DeviceId); }
             await store.SaveAsync(_preferences, _lifetime.Token);
             CleanSnapshots();
             Publish();
@@ -239,13 +270,27 @@ public sealed class DeviceSyncCoordinator(
 
     private async Task<DeviceSyncSnapshot> CurrentSnapshotAsync(CancellationToken token)
     {
-        var revision = await data.GetRevisionAsync(token);
-        if (_snapshot?.Revision == revision) return _snapshot;
-        var directory = Path.Combine(_root, "out-" + Guid.NewGuid().ToString("N"));
-        _snapshots.Add(directory);
-        try { _snapshot = await data.PrepareAsync(directory, token); }
-        finally { CleanSnapshots(); }
-        return _snapshot;
+        if (_failureStage == "preparing") { _error = null; _failureStage = ""; _failureKind = ""; _failureOperation = ""; _failureRequestBytes = 0; }
+        try
+        {
+            var receiveOnly = _preferences!.Mode == DeviceSyncMode.ReceiveOnly;
+            var revision = receiveOnly ? ReceiveOnlyRevision : await data.GetRevisionAsync(token);
+            if (_snapshot?.Revision == revision) return _snapshot;
+            var directory = Path.Combine(_root, "out-" + Guid.NewGuid().ToString("N"));
+            _snapshots.Add(directory);
+            if (receiveOnly)
+            {
+                Directory.CreateDirectory(directory);
+                _snapshot = new DeviceSyncSnapshot("monica-passwords-v1", revision, directory, "");
+            }
+            else _snapshot = await data.PrepareAsync(directory, token);
+            return _snapshot;
+        }
+        finally
+        {
+            CleanSnapshots();
+            if (_progress?.Stage == "preparing") { _progress = null; if (_phase == "preparing") _phase = "idle"; }
+        }
     }
 
     private async Task<Transfer> StartTransferAsync(DeviceSyncSnapshot snapshot, DeviceSyncPeer? peer,
@@ -267,12 +312,13 @@ public sealed class DeviceSyncCoordinator(
                     device_id = _preferences!.DeviceId, name = Environment.MachineName,
                     pair_id = peer?.PairId ?? "", interval_seconds = _preferences.IntervalSeconds,
                     settings_version = _preferences.SettingsVersion, settings_writer = _preferences.SettingsWriter,
-                    sync_request = _preferences.SyncRequest, revision = snapshot.Revision, content_type = "vault", vault_content_version = 2
+                    sync_request = _preferences.SyncRequest, revision = snapshot.Revision, content_type = "vault", vault_content_version = 2,
+                    sync_mode = (enrollment ? DeviceSyncMode.Bidirectional : _preferences.Mode).ToWire()
                 },
                 trusted_key = invitation is null ? peer?.TrustedKey : null,
                 expected_device_id = peer?.DeviceId, revision = advertisement,
                 vault_id = snapshot.VaultId, content_key = snapshot.ContentKey,
-                outgoing_directory = snapshot.Directory, incoming_directory = directory
+                outgoing_directory = !enrollment && _preferences.Mode == DeviceSyncMode.ReceiveOnly ? null : snapshot.Directory, incoming_directory = directory
             }));
         }
         catch { DeleteOwned(directory); throw; }
@@ -417,7 +463,7 @@ public sealed class DeviceSyncCoordinator(
         else if (phase != "waiting") _statuses[id] = "syncing";
         if (phase == "waiting" && !transfer.Enrollment)
         {
-            var revision = await data.GetRevisionAsync(token);
+            var revision = _preferences!.Mode == DeviceSyncMode.ReceiveOnly ? ReceiveOnlyRevision : await data.GetRevisionAsync(token);
             if (Advertisement(revision) != transfer.Advertisement)
             { await StopAsync(transfer); _transfers.Remove(id); }
             return;
@@ -426,7 +472,9 @@ public sealed class DeviceSyncCoordinator(
         {
             var remotePeer = progress.GetProperty("peer");
             var pairingOnly = transfer.Enrollment && remotePeer.GetProperty("revision").GetString() == DevicePairingSnapshot.Revision;
-            if (!pairingOnly && !CanApply()) return;
+            var receiveContent = !pairingOnly && _preferences!.Mode != DeviceSyncMode.SendOnly &&
+                (!remotePeer.TryGetProperty("receive_content", out var received) || received.GetBoolean());
+            if (receiveContent && !CanApply()) return;
             transfer.ApplyAttempted = true; // A rejected batch must never be retried on every progress tick.
             transfer.Stage = "applying";
             transfer.Peer = remotePeer.Clone();
@@ -437,7 +485,7 @@ public sealed class DeviceSyncCoordinator(
                 if (remote.GetProperty("content_type").GetString() != "vault" || !remote.TryGetProperty("vault_content_version", out var contentVersion) || contentVersion.GetInt32() != 2)
                     throw new LanSyncException("unsupported_protocol");
                 if (remote.GetProperty("device_id").GetString() == _preferences!.DeviceId) throw new LanSyncException("same_device");
-                var changed = pairingOnly ? 0 : await data.ApplyAsync(transfer.Root, remote, token);
+                var changed = receiveContent ? await data.ApplyAsync(transfer.Root, remote, token) : 0;
                 if (changed > 0) PasswordsChanged?.Invoke(this, EventArgs.Empty);
                 _preferences.AcceptInterval(remote.GetProperty("interval_seconds").GetInt32(),
                     remote.GetProperty("settings_version").GetUInt64(), remote.GetProperty("settings_writer").GetString() ?? "");
@@ -593,6 +641,7 @@ public sealed class DeviceSyncCoordinator(
         _failureOperation = (error as LanSyncException)?.Operation ?? "";
         _failureRequestBytes = (error as LanSyncException)?.RequestBytes ?? 0;
         _connectionAttempts = attempts;
+        _phase = "failed"; _progress = null;
     }
 
     private static string ErrorCode(Exception error)
@@ -601,7 +650,8 @@ public sealed class DeviceSyncCoordinator(
         if (error is PlatformNotSupportedException or NotSupportedException) return "device_sync_unavailable";
         // Preserve only application-owned constant reasons, never exception payloads or secrets.
         if (error.Message is "invalid_password_payload" or "password_source_unavailable" or "device_sync_read_only" or
-            "invalid_password_identity" or "password_identity_collision" or "password_changed" or "device_sync_write_failed") return error.Message;
+            "invalid_password_identity" or "password_identity_collision" or "password_changed" or "device_sync_write_failed" or
+            "invalid_passkey_material" or "passkey_key_unavailable" or "passkey_conflict") return error.Message;
         return "device_sync_failed";
     }
 

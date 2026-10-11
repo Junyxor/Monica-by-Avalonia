@@ -16,6 +16,41 @@ public sealed class LanSyncUiTests
     public LanSyncUiTests() => AvaloniaUiThreadTestContext.VerifyAccess();
 
     [Fact]
+    public void Direction_choices_follow_state_and_failures_hide_completed_preparation_progress()
+    {
+        var main = new Monica.App.MainWindow();
+        using var services = Monica.App.App.ConfigureServices(main);
+        services.GetRequiredService<ILocalizationService>().SetLanguage("zh-CN");
+        var vm = services.GetRequiredService<MainWindowViewModel>();
+        var view = new LanSyncView { DataContext = vm };
+        var host = new Window { Content = view };
+        host.Show();
+        try
+        {
+            vm.ApplyDeviceSyncState(new DeviceSyncState(true, 0, [new("phone", "Phone", "first_sync_pending", null)],
+                Mode: DeviceSyncMode.ReceiveOnly));
+            Dispatcher.UIThread.RunJobs();
+            Assert.Equal(new[] { DeviceSyncMode.Bidirectional, DeviceSyncMode.SendOnly, DeviceSyncMode.ReceiveOnly }, vm.DeviceSyncModes.Select(item => item.Mode));
+            Assert.Equal(DeviceSyncMode.ReceiveOnly, vm.SelectedDeviceSyncMode!.Mode);
+            Assert.Equal(vm.SelectedDeviceSyncMode, view.FindControl<ComboBox>("DeviceSyncModeBox")!.SelectedItem);
+            Assert.Equal("已配对 · 首次同步未完成", Assert.Single(vm.SyncedDevices).Status);
+            Assert.Empty(Assert.Single(vm.SyncedDevices).LastSynced);
+            vm.ApplyDeviceSyncState(new DeviceSyncState(true, 0, [new("phone", "Phone", "preparation_failed", null)],
+                Phase: "failed", Error: "invalid_passkey_material", FailureStage: "preparing", Mode: DeviceSyncMode.ReceiveOnly));
+            Dispatcher.UIThread.RunJobs();
+            Assert.False(vm.IsLanBusy);
+            Assert.False(view.FindControl<ProgressBar>("LanSyncProgress")!.IsVisible);
+            Assert.Equal("已配对 · 准备同步失败", Assert.Single(vm.SyncedDevices).Status);
+            Assert.Contains("receive_only", vm.LanDiagnosticText);
+            vm.ApplyDeviceSyncState(new DeviceSyncState(true, 0, [], Phase: "failed", Error: "sync_direction_conflict", Mode: DeviceSyncMode.SendOnly));
+            Assert.Contains("双方都设为", vm.LanErrorText);
+            vm.ApplyDeviceSyncState(new DeviceSyncState(true, 0, [], Phase: "failed", Error: "sync_direction_unsupported", Mode: DeviceSyncMode.SendOnly));
+            Assert.Contains("不支持单向", vm.LanErrorText);
+        }
+        finally { host.Close(); main.Close(); }
+    }
+
+    [Fact]
     public void Request_failures_show_operation_and_byte_count_without_pairing_secrets()
     {
         var main = new Monica.App.MainWindow();

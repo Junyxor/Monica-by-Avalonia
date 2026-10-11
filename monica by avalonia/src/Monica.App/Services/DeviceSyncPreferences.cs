@@ -1,9 +1,24 @@
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Monica.Data;
 using Monica.Platform.Services;
 
 namespace Monica.App.Services;
+
+[JsonConverter(typeof(JsonStringEnumConverter<DeviceSyncMode>))]
+public enum DeviceSyncMode { Bidirectional, SendOnly, ReceiveOnly }
+
+public static class DeviceSyncModeNames
+{
+    public static string ToWire(this DeviceSyncMode mode) => mode switch
+    {
+        DeviceSyncMode.Bidirectional => "bidirectional",
+        DeviceSyncMode.SendOnly => "send_only",
+        DeviceSyncMode.ReceiveOnly => "receive_only",
+        _ => throw new ArgumentOutOfRangeException(nameof(mode))
+    };
+}
 
 public sealed class DeviceSyncPeer
 {
@@ -31,6 +46,7 @@ public sealed class DeviceSyncPreferences
     public string SettingsWriter { get; set; } = "";
     public ulong SyncRequest { get; set; }
     public List<DeviceSyncPeer> Peers { get; set; } = [];
+    public DeviceSyncMode Mode { get; set; } = DeviceSyncMode.Bidirectional;
 
     public void SetInterval(int seconds)
     {
@@ -73,7 +89,7 @@ public sealed class DeviceSyncPreferenceStore(ISecretProtector protector, string
             var protectedText = await File.ReadAllTextAsync(_path, token);
             var plain = await protector.UnprotectAsync(protectedText, token);
             var settings = JsonSerializer.Deserialize<DeviceSyncPreferences>(plain) ?? throw new InvalidDataException("device_sync_preferences_invalid");
-            if (settings.Version != 1 || settings.Peers.Count > 8 || settings.DeviceId.Length > 64 ||
+            if (settings.Version != 1 || settings.Peers.Count > 8 || settings.DeviceId.Length > 64 || !Enum.IsDefined(settings.Mode) ||
                 (settings.IntervalSeconds != 0 && settings.IntervalSeconds is not (>= 60 and <= 86400)))
                 throw new InvalidDataException("device_sync_preferences_invalid");
             foreach (var peer in settings.Peers)

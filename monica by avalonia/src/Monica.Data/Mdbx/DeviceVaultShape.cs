@@ -60,6 +60,9 @@ public static class DeviceVaultShape
                 if (string.IsNullOrWhiteSpace(payload["credential_id"]!.GetValue<string>()) || string.IsNullOrWhiteSpace(payload["rp_id"]!.GetValue<string>()) ||
                     payload["public_key"]!.GetValue<string>().Length == 0 || payload["public_key_algorithm"] is not JsonValue algorithm || !algorithm.TryGetValue<int>(out _) ||
                     payload["key_status"]!.GetValue<string>() is not ("portable" or "reference")) throw new InvalidDataException("invalid_passkey_material");
+                var eligibility = BackupFlag(payload, "backup_eligible");
+                var state = BackupFlag(payload, "backup_state");
+                if (eligibility == false && state == true) throw new InvalidDataException("invalid_passkey_material");
             }
             if (type is "folder" or "vault-metadata") {
                 if(type == "folder") ValidatePath(payload["path"]);
@@ -224,8 +227,28 @@ public static class DeviceVaultShape
         {
             throw new InvalidDataException("passkey_conflict");
         }
+        PreserveBackupFlags(incoming, previous);
         // A metadata-only reference cannot erase the local private key or claim a new backup.
         if (Text(incoming, "private_key_alias").Length == 0 && oldKey.Length > 0)
             incoming["private_key_alias"] = oldKey;
+    }
+
+    private static void PreserveBackupFlags(JsonObject incoming, JsonObject previous)
+    {
+        var oldEligibility = BackupFlag(previous, "backup_eligible");
+        var eligibility = BackupFlag(incoming, "backup_eligible");
+        if (eligibility is not null && eligibility != (oldEligibility ?? true)) throw new InvalidDataException("passkey_conflict");
+        eligibility ??= oldEligibility;
+        var state = BackupFlag(incoming, "backup_state") ?? BackupFlag(previous, "backup_state");
+        if (eligibility == false && state == true) throw new InvalidDataException("invalid_passkey_material");
+        if (eligibility is not null) incoming["backup_eligible"] = eligibility.Value;
+        if (state is not null) incoming["backup_state"] = state.Value;
+    }
+
+    private static bool? BackupFlag(JsonObject value, string name)
+    {
+        if (value[name] is null) return null;
+        if (value[name] is JsonValue flag && flag.TryGetValue<bool>(out var result)) return result;
+        throw new InvalidDataException("invalid_passkey_material");
     }
 }

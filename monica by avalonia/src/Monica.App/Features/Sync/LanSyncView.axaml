@@ -7,6 +7,11 @@
             <TextBlock x:Name="LanSyncTitle" Text="{Binding L[LanTitle]}" FontSize="24" FontWeight="SemiBold" />
             <TextBlock Text="{Binding L[DeviceSyncDescription]}" TextWrapping="Wrap" />
             <ToggleSwitch x:Name="DeviceSyncEnabledToggle" Content="{Binding L[DeviceSyncAutomatic]}" IsChecked="{Binding DeviceSyncEnabled}" />
+            <TextBlock Text="{Binding L[DeviceSyncDirection]}" FontWeight="SemiBold" />
+            <ComboBox x:Name="DeviceSyncModeBox" ItemsSource="{Binding DeviceSyncModes}" SelectedItem="{Binding SelectedDeviceSyncMode}" IsEnabled="{Binding !IsDeviceSyncPairing}" HorizontalAlignment="Stretch">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="vm:DeviceSyncModeChoice"><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+            </ComboBox>
+            <TextBlock Text="{Binding L[DeviceSyncDirectionHint]}" TextWrapping="Wrap" Opacity="0.7" />
             <TextBlock Text="{Binding L[DeviceSyncFrequency]}" FontWeight="SemiBold" />
             <ComboBox x:Name="DeviceSyncFrequencyBox" ItemsSource="{Binding DeviceSyncFrequencies}" SelectedItem="{Binding SelectedDeviceSyncFrequency}" HorizontalAlignment="Stretch">
                 <ComboBox.ItemTemplate><DataTemplate x:DataType="vm:DeviceSyncFrequencyChoice"><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
