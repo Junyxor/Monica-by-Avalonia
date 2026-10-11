@@ -65,6 +65,7 @@ public sealed partial class MainWindowViewModel
     public bool IsSyncConfigurationSelected => IsWorkspacePageSelected(SelectedSyncPage, "Configuration");
     public bool IsSyncBackupSelected => IsWorkspacePageSelected(SelectedSyncPage, "Backup");
     public bool IsSyncSourcesSelected => IsWorkspacePageSelected(SelectedSyncPage, "Sources");
+    public bool IsSyncDevicesSelected => IsWorkspacePageSelected(SelectedSyncPage, "Devices");
     public bool IsSyncImportSelected => IsWorkspacePageSelected(SelectedSyncPage, "Import");
     public bool IsSyncExportSelected => IsWorkspacePageSelected(SelectedSyncPage, "Export");
 
@@ -75,7 +76,7 @@ public sealed partial class MainWindowViewModel
     /// already opens. The configuration, backup and sources pages keep the strip, because there each
     /// card points at a control on the same screen.
     /// </summary>
-    public bool ShowsSyncHealthOverview => !IsSyncImportSelected && !IsSyncExportSelected;
+    public bool ShowsSyncHealthOverview => !IsSyncImportSelected && !IsSyncExportSelected && !IsSyncDevicesSelected;
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(HasSelectedWebDavBackupHistoryItem))]
     private WebDavBackupHistoryItem? _selectedWebDavBackupHistoryItem;
@@ -84,6 +85,7 @@ public sealed partial class MainWindowViewModel
     [NotifyPropertyChangedFor(nameof(IsSyncConfigurationSelected))]
     [NotifyPropertyChangedFor(nameof(IsSyncBackupSelected))]
     [NotifyPropertyChangedFor(nameof(IsSyncSourcesSelected))]
+    [NotifyPropertyChangedFor(nameof(IsSyncDevicesSelected))]
     [NotifyPropertyChangedFor(nameof(IsSyncImportSelected))]
     [NotifyPropertyChangedFor(nameof(IsSyncExportSelected))]
     [NotifyPropertyChangedFor(nameof(ShowsSyncHealthOverview))]

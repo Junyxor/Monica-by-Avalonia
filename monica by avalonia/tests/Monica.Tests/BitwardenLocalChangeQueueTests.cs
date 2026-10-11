@@ -6,7 +6,9 @@ using Monica.Core.Models;
 using Monica.Core.Services;
 using Monica.Data;
 using Monica.Data.Bitwarden;
+using Monica.Data.Mdbx;
 using Monica.Data.Repositories;
+using Monica.Platform.Services;
 
 namespace Monica.Tests;
 
@@ -19,6 +21,223 @@ public sealed class BitwardenLocalChangeQueueTests
 {
     private const string BaselineRevision = "2026-07-22T03:00:00Z";
     private const string NextRevision = "2026-07-22T04:00:00Z";
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_real_native_pull_keeps_identity_and_applies_remote_trash_and_restore(bool password)
+    {
+        var harness = await CreateHarnessAsync(useNativeStore: true);
+        try
+        {
+            var remote = password ? BaselineCipher() : BoundNoteCipher();
+            await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+            var repeated = await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+            Assert.Equal(0, repeated.Added);
+            var trashed = RemoteTrashOf(remote, NextRevision);
+            await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([trashed]), [trashed]);
+            if (password)
+            {
+                Assert.Empty(await harness.Repository.GetPasswordsAsync());
+                Assert.True((await ReadAsync(harness)).IsDeleted);
+                Assert.Equal(NextRevision, (await ReadAsync(harness)).BitwardenRevisionDate);
+            }
+            else
+            {
+                Assert.Empty(await harness.Repository.GetSecureItemsAsync());
+                Assert.True((await ReadNoteAsync(harness)).IsDeleted);
+                Assert.Equal(NextRevision, (await ReadNoteAsync(harness)).BitwardenRevisionDate);
+            }
+
+            var restored = remote with { Metadata = remote.Metadata with { RevisionDate = "2026-07-22T05:00:00Z" } };
+            await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([restored]), [restored]);
+            if (password) Assert.Equal(remote.Metadata.CipherId, Assert.Single(await harness.Repository.GetPasswordsAsync()).BitwardenCipherId);
+            else Assert.Equal(remote.Metadata.CipherId, Assert.Single(await harness.Repository.GetSecureItemsAsync()).BitwardenCipherId);
+        }
+        finally { harness.NativeStore?.Dispose(); }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_stale_update_then_newer_pull_preserves_an_ordinary_edit(bool password)
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = password ? BaselineCipher() : BoundNoteCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        if (password)
+        {
+            var local = await RenameAsync(harness, "Local edit before conflict");
+            Assert.False(local.BitwardenLocalModified);
+        }
+        else
+        {
+            var local = await ReadNoteAsync(harness);
+            local.Title = "Local edit before conflict";
+            await harness.Repository.SaveSecureItemAsync(local);
+            Assert.False(local.BitwardenLocalModified);
+        }
+
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow);
+        var rejected = await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow,
+            new AcceptedTransport(NextRevision, failureStatus: 400, failureClass: BitwardenFailureClass.Conflict));
+        Assert.Equal(1, rejected.Conflicts);
+
+        var newer = remote with { Metadata = remote.Metadata with { RevisionDate = NextRevision } };
+        var pull = await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([newer]), [newer]);
+
+        Assert.Equal(1, pull.ConflictsBackedUp);
+        var backup = Assert.Single(await harness.ConflictStore.GetUnresolvedAsync(harness.VaultId));
+        using var saved = JsonDocument.Parse(backup.PayloadJson);
+        Assert.Equal("Local edit before conflict", saved.RootElement
+            .GetProperty(password ? "password" : "secureItem").GetProperty("Title").GetString());
+
+        // Choosing the saved local version is a new decision based on the current server revision.
+        await harness.Restore.RestoreAsync(harness.VaultId, backup.Id);
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow);
+        var accepted = await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow,
+            new AcceptedTransport("2026-07-22T05:00:00Z"));
+        Assert.Equal(1, accepted.Completed);
+    }
+
+    [Fact]
+    public async Task Review_a_rescan_after_a_failed_pull_does_not_restart_the_same_conflict()
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = BaselineCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        await RenameAsync(harness, "Local edit awaiting conflict resolution");
+        var transport = new AcceptedTransport(NextRevision, failureStatus: 400, failureClass: BitwardenFailureClass.Conflict);
+        var now = DateTimeOffset.UtcNow;
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, now);
+        await harness.Processor.ProcessReadyAsync(harness.VaultId, now, transport);
+
+        // The download failed, so the next run sees the same local content and the same baseline.
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, now.AddMinutes(1));
+        var repeated = await harness.Processor.ProcessReadyAsync(harness.VaultId, now.AddMinutes(1), transport);
+
+        Assert.Equal(0, repeated.Claimed);
+        Assert.Equal(1, transport.Sends);
+        var operation = Assert.Single(await harness.Pending.GetAsync(harness.VaultId));
+        Assert.Equal(BitwardenMutationStatus.Conflict, operation.Status);
+        Assert.Equal(1, operation.AttemptCount);
+    }
+
+    [Fact]
+    public async Task Review_a_rescan_preserves_the_existing_retry_backoff()
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = BaselineCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        await RenameAsync(harness, "Rate limited edit");
+        var now = DateTimeOffset.UtcNow;
+        var transport = new AcceptedTransport(NextRevision, failureStatus: 429);
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, now);
+        await harness.Processor.ProcessReadyAsync(harness.VaultId, now, transport);
+        var waiting = Assert.Single(await harness.Pending.GetAsync(harness.VaultId));
+
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, now.AddMilliseconds(100));
+        var rescanned = Assert.Single(await harness.Pending.GetAsync(harness.VaultId));
+
+        Assert.Equal(waiting.AttemptCount, rescanned.AttemptCount);
+        Assert.Equal(waiting.NextAttemptAt, rescanned.NextAttemptAt);
+        Assert.Equal(waiting.LastFailureClass, rescanned.LastFailureClass);
+        Assert.Equal(0, (await harness.Processor.ProcessReadyAsync(
+            harness.VaultId, now.AddMilliseconds(100), transport)).Claimed);
+    }
+
+    [Fact]
+    public async Task Review_discarding_an_old_backup_does_not_cancel_a_later_permanent_erase()
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = BaselineCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        await RenameAsync(harness, "Old conflicting edit");
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow);
+        await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow, new AcceptedTransport(NextRevision, reject: true));
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        var backup = Assert.Single(await harness.ConflictStore.GetUnresolvedAsync(harness.VaultId));
+        var current = await ReadAsync(harness);
+        Assert.True(await harness.Purge.EnqueuePasswordAsync(current));
+        await harness.Repository.DeletePasswordPermanentlyAsync(current.Id);
+        await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow, new AcceptedTransport(NextRevision, reject: true));
+
+        await harness.Restore.DiscardAsync(harness.VaultId, backup.Id);
+
+        var erase = Assert.Single(await harness.Pending.GetAsync(harness.VaultId),
+            operation => operation.OperationType == BitwardenMutationOperationType.Delete);
+        Assert.Equal(BitwardenMutationStatus.Conflict, erase.Status);
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        Assert.Empty(await harness.Repository.GetPasswordsAsync());
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_an_item_purged_during_upload_is_not_reinserted(bool password)
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = password ? BaselineCipher() : BoundNoteCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        if (password) await RenameAsync(harness, "Edit before purge");
+        else
+        {
+            var note = await ReadNoteAsync(harness);
+            note.Title = "Edit before purge";
+            await harness.Repository.SaveSecureItemAsync(note);
+        }
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow);
+        var transport = new AcceptedTransport(NextRevision, beforeResponse: async () =>
+        {
+            if (password) await harness.Repository.DeletePasswordPermanentlyAsync((await ReadAsync(harness)).Id);
+            else await harness.Repository.DeleteSecureItemPermanentlyAsync((await ReadNoteAsync(harness)).Id);
+        });
+        Assert.Equal(1, (await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow, transport)).Completed);
+        Assert.Empty(await harness.Repository.GetPasswordsAsync(true, true));
+        Assert.Empty(await harness.Repository.GetSecureItemsAsync(includeDeleted: true));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_an_edit_saved_during_upload_survives_the_success_callback(bool password)
+    {
+        var harness = await CreateHarnessAsync();
+        var remote = password ? BaselineCipher() : BoundNoteCipher();
+        await harness.Pull.ApplyAsync(harness.VaultId, Snapshot([remote]), [remote]);
+        async Task RenameLocal(string title)
+        {
+            if (password) await RenameAsync(harness, title);
+            else
+            {
+                var item = await ReadNoteAsync(harness);
+                item.Title = title;
+                await harness.Repository.SaveSecureItemAsync(item);
+            }
+        }
+        await RenameLocal("Content being uploaded");
+        await harness.Queue.EnqueueDriftedAsync(harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow);
+
+        var transport = new AcceptedTransport(NextRevision,
+            beforeResponse: () => RenameLocal("Saved while the request was in flight"));
+        var result = await harness.Processor.ProcessReadyAsync(harness.VaultId, DateTimeOffset.UtcNow, transport);
+
+        Assert.Equal(1, result.Completed);
+        if (password)
+        {
+            var local = await ReadAsync(harness);
+            Assert.Equal("Saved while the request was in flight", local.Title);
+            Assert.Equal(NextRevision, local.BitwardenRevisionDate);
+        }
+        else
+        {
+            var local = await ReadNoteAsync(harness);
+            Assert.Equal("Saved while the request was in flight", local.Title);
+            Assert.Equal(NextRevision, local.BitwardenRevisionDate);
+        }
+        Assert.Equal(1, (await harness.Queue.EnqueueDriftedAsync(
+            harness.VaultId, harness.VaultKey, DateTimeOffset.UtcNow)).Enqueued);
+    }
 
     [Fact]
     public async Task The_baseline_left_by_a_pull_fingerprints_the_same_as_the_stored_row()
@@ -1149,11 +1368,13 @@ public sealed class BitwardenLocalChangeQueueTests
         Assert.Equal(
             BitwardenPayloadFingerprint.ForPassword(remote.Password!, [], []),
             baseline["cipher-edit"]);
-        // The server never took the edit, so the next sync has to try again.
-        Assert.Equal(1, (await harness.Queue.EnqueueDriftedAsync(
+        // The edit remains recoverable, but rescanning it is not a decision to retry a conflict.
+        await harness.Queue.EnqueueDriftedAsync(
             harness.VaultId,
             harness.VaultKey,
-            DateTimeOffset.UtcNow)).Enqueued);
+            DateTimeOffset.UtcNow);
+        Assert.Equal(BitwardenMutationStatus.Conflict,
+            Assert.Single(await harness.Pending.GetAsync(harness.VaultId)).Status);
     }
 
     [Fact]
@@ -1268,7 +1489,7 @@ public sealed class BitwardenLocalChangeQueueTests
                 harness.VaultId,
                 DateTimeOffset.UtcNow,
                 new AcceptedTransport(NextRevision, reject: true));
-            Assert.Equal(1, batch.Conflicts);
+            Assert.Equal(sync == 1 ? 1 : 0, batch.Conflicts);
         }
 
         // A rejected upload destroys nothing local - the edit is still on screen and still owed - so
@@ -1846,7 +2067,7 @@ public sealed class BitwardenLocalChangeQueueTests
             true,
             new DateTimeOffset(2026, 7, 22, 3, 5, 0, TimeSpan.Zero));
 
-    private static async Task<Harness> CreateHarnessAsync()
+    private static async Task<Harness> CreateHarnessAsync(bool useNativeStore = false)
     {
         var factory = new SqliteConnectionFactory(TestTempPaths.CreateFilePath(".db"));
         var migrator = new DatabaseMigrator(factory);
@@ -1854,7 +2075,21 @@ public sealed class BitwardenLocalChangeQueueTests
         var hash = crypto.HashMasterPassword("vault password");
         crypto.InitializeSession("vault password", hash.Salt);
         var protector = new VaultDataProtector(crypto);
-        var repository = new MonicaRepository(factory, migrator, protector);
+        IMonicaRepository repository = new MonicaRepository(factory, migrator, protector);
+        MdbxVaultStore? nativeStore = null;
+        if (useNativeStore)
+        {
+            var bridge = new MdbxUniffiNativeBridge();
+            var path = TestTempPaths.CreateFilePath(".mdbx");
+            using (await bridge.CreateVaultAsync(path, "native-sync-fixture", "test", MdbxTigaMode.Multi)) { }
+            nativeStore = new MdbxVaultStore(bridge);
+            repository = new MdbxBackedMonicaRepository(repository, nativeStore);
+            await repository.SaveMdbxDatabaseAsync(new LocalMdbxDatabase
+            {
+                Name = "Synthetic", FilePath = path, WorkingCopyPath = path, EncryptedPassword = "native-sync-fixture",
+                IsDefault = true, IsOfflineAvailable = true, StorageLocation = MdbxStorageLocation.Internal
+            });
+        }
         var accountStore = new BitwardenAccountStore(factory, migrator, crypto);
         var endpoints = BitwardenEndpointSet.UnitedStates;
         using var secrets = new BitwardenAccountSecrets(
@@ -1882,14 +2117,15 @@ public sealed class BitwardenLocalChangeQueueTests
             new BitwardenPullMergeService(repository, folderStore, conflictStore, syncState, pending),
             new BitwardenLocalChangeQueue(repository, syncState, pending, folderStore),
             new BitwardenMutationProcessor(pending, syncState, repository),
-            new BitwardenConflictRestoreService(repository, conflictStore),
+            new BitwardenConflictRestoreService(repository, conflictStore, pending),
             new BitwardenPurgeQueue(pending),
             new BitwardenSymmetricKey(
                 Enumerable.Repeat((byte)1, 32).ToArray(),
                 Enumerable.Repeat((byte)2, 32).ToArray()),
             factory,
             migrator,
-            account.Id);
+            account.Id,
+            nativeStore);
     }
 
     private sealed record Harness(
@@ -1905,34 +2141,38 @@ public sealed class BitwardenLocalChangeQueueTests
         BitwardenSymmetricKey VaultKey,
         SqliteConnectionFactory Factory,
         DatabaseMigrator Migrator,
-        long VaultId);
+        long VaultId,
+        MdbxVaultStore? NativeStore);
 
     private sealed class AcceptedTransport(
         string revision,
         bool reject = false,
         string? assignedCipherId = null,
-        int? failureStatus = null) : IBitwardenMutationTransport
+        int? failureStatus = null,
+        BitwardenFailureClass? failureClass = null,
+        Func<Task>? beforeResponse = null) : IBitwardenMutationTransport
     {
         public int Sends { get; private set; }
 
-        public Task<BitwardenMutationResponse> SendAsync(
+        public async Task<BitwardenMutationResponse> SendAsync(
             BitwardenMutationRequest request,
             CancellationToken cancellationToken = default)
         {
             Sends++;
+            if (beforeResponse is not null) await beforeResponse();
             int? failure = failureStatus ?? (reject ? (int?)409 : null);
             if (failure is { } status)
             {
-                return Task.FromResult(new BitwardenMutationResponse(
+                return new BitwardenMutationResponse(
                     false,
                     request.CipherId,
                     null,
                     status,
-                    $"Bitwarden mutation answered HTTP {status}."));
+                    $"Bitwarden mutation answered HTTP {status}.",
+                    FailureClass: failureClass);
             }
 
-            return Task.FromResult(
-                new BitwardenMutationResponse(true, assignedCipherId ?? request.CipherId, revision));
+            return new BitwardenMutationResponse(true, assignedCipherId ?? request.CipherId, revision);
         }
     }
 }

@@ -113,6 +113,7 @@ public sealed partial class MainWindowViewModel
 
         ClearSensitiveSessionState();
         CancelBitwardenOperationAndClearSecrets();
+        CancelLanSyncAndClearSecrets();
         SetShellHibernatedByLock(true);
         _vaultSessionService.MarkLocked();
         RaiseMdbxSnapshotState();

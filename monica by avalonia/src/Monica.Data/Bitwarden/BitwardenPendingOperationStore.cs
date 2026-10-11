@@ -12,6 +12,10 @@ public interface IBitwardenPendingOperationStore
         BitwardenPendingOperation operation,
         CancellationToken cancellationToken = default);
 
+    Task<long> EnqueueFromScanAsync(
+        BitwardenPendingOperation operation,
+        CancellationToken cancellationToken = default);
+
     Task<IReadOnlyList<BitwardenPendingOperation>> ClaimReadyAsync(
         long vaultId,
         DateTimeOffset now,
@@ -42,9 +46,20 @@ public sealed partial class BitwardenPendingOperationStore(
     public static readonly TimeSpan ClaimTimeout = TimeSpan.FromMinutes(10);
     private readonly BitwardenAccountSecretProtector _protector = new(cryptoService);
 
-    public async Task<long> EnqueueAsync(
+    public Task<long> EnqueueAsync(
         BitwardenPendingOperation operation,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        EnqueueCoreAsync(operation, preserveExistingState: false, cancellationToken);
+
+    public Task<long> EnqueueFromScanAsync(
+        BitwardenPendingOperation operation,
+        CancellationToken cancellationToken = default) =>
+        EnqueueCoreAsync(operation, preserveExistingState: true, cancellationToken);
+
+    private async Task<long> EnqueueCoreAsync(
+        BitwardenPendingOperation operation,
+        bool preserveExistingState,
+        CancellationToken cancellationToken)
     {
         ValidateForEnqueue(operation);
         var now = operation.UpdatedAt == default ? DateTimeOffset.UtcNow : operation.UpdatedAt;
@@ -55,7 +70,35 @@ public sealed partial class BitwardenPendingOperationStore(
         await migrator.MigrateAsync(cancellationToken);
         await using var connection = connectionFactory.CreateConnection();
         await connection.OpenAsync(cancellationToken);
-        return await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        var existingRow = await connection.QuerySingleOrDefaultAsync<PendingOperationRow>(new CommandDefinition(
+            SelectSql + " WHERE idempotency_key = @IdempotencyKey",
+            new { operation.IdempotencyKey },
+            transaction,
+            cancellationToken: cancellationToken));
+        if (existingRow is not null)
+        {
+            var existing = Map(existingRow);
+            if (existing.VaultId != operation.VaultId || existing.CipherId != operation.CipherId ||
+                existing.OperationType != operation.OperationType)
+            {
+                throw new BitwardenProtocolException("Bitwarden operation key belongs to a different mutation.");
+            }
+
+            // Re-encryption changes ciphertext on every scan, so compare the local content
+            // fingerprint when available. An unchanged scan must retain conflicts and backoff.
+            var sameContent = existing.LocalPayloadHash is not null && operation.LocalPayloadHash is not null
+                ? string.Equals(existing.LocalPayloadHash, operation.LocalPayloadHash, StringComparison.Ordinal)
+                : string.Equals(existing.PayloadJson, operation.PayloadJson, StringComparison.Ordinal);
+            if (existing.Status == BitwardenMutationStatus.InFlight ||
+                (preserveExistingState && existing.Status != BitwardenMutationStatus.Completed && sameContent &&
+                 string.Equals(existing.ExpectedRemoteRevision, operation.ExpectedRemoteRevision, StringComparison.Ordinal)))
+            {
+                return existing.Id;
+            }
+        }
+
+        var id = await connection.ExecuteScalarAsync<long>(new CommandDefinition(
             """
             INSERT INTO bitwarden_pending_operations (
                 bitwarden_vault_id, cipher_id, operation_type, expected_remote_revision,
@@ -95,7 +138,10 @@ public sealed partial class BitwardenPendingOperationStore(
                 CreatedAt = createdAt.ToUniversalTime().ToUnixTimeMilliseconds(),
                 UpdatedAt = now.ToUniversalTime().ToUnixTimeMilliseconds()
             },
+            transaction,
             cancellationToken: cancellationToken));
+        await transaction.CommitAsync(cancellationToken);
+        return id;
     }
 
     public async Task<IReadOnlyList<BitwardenPendingOperation>> ClaimReadyAsync(

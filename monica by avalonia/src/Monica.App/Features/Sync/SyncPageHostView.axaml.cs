@@ -59,6 +59,7 @@ public partial class SyncPageHostView : UserControl
     {
         "backup" => new SyncBackupView(),
         "sources" => new SyncSourcesView(),
+        "devices" => new LanSyncView(),
         "import" => new SyncImportView(),
         "export" => new SyncExportView(),
         _ => new SyncConfigurationView()

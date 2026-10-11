@@ -1,0 +1,69 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Monica.App.ViewModels"
+             x:Class="Monica.App.Features.Sync.LanSyncView"
+             x:DataType="vm:MainWindowViewModel">
+        <StackPanel Spacing="12" Margin="4,12">
+            <TextBlock x:Name="LanSyncTitle" Text="{Binding L[LanTitle]}" FontSize="24" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding L[DeviceSyncDescription]}" TextWrapping="Wrap" />
+            <ToggleSwitch x:Name="DeviceSyncEnabledToggle" Content="{Binding L[DeviceSyncAutomatic]}" IsChecked="{Binding DeviceSyncEnabled}" />
+            <TextBlock Text="{Binding L[DeviceSyncFrequency]}" FontWeight="SemiBold" />
+            <ComboBox x:Name="DeviceSyncFrequencyBox" ItemsSource="{Binding DeviceSyncFrequencies}" SelectedItem="{Binding SelectedDeviceSyncFrequency}" HorizontalAlignment="Stretch">
+                <ComboBox.ItemTemplate><DataTemplate x:DataType="vm:DeviceSyncFrequencyChoice"><TextBlock Text="{Binding Label}" /></DataTemplate></ComboBox.ItemTemplate>
+            </ComboBox>
+            <StackPanel IsVisible="{Binding IsCustomDeviceSyncInterval}" Spacing="8">
+                <TextBox x:Name="DeviceSyncMinutesBox" Text="{Binding DeviceSyncCustomMinutes}" MaxLength="4" PlaceholderText="{Binding L[DeviceSyncMinutesHint]}" />
+                <Button Content="{Binding L[DeviceSyncSave]}" Command="{Binding ApplyDeviceSyncIntervalCommand}" />
+            </StackPanel>
+            <TextBlock Text="{Binding L[DeviceSyncFrequencyHint]}" TextWrapping="Wrap" Opacity="0.7" />
+            <Button x:Name="DeviceSyncNowButton" Content="{Binding L[DeviceSyncNow]}" Command="{Binding SyncDevicesNowCommand}" IsEnabled="{Binding DeviceSyncEnabled}" />
+            <TextBlock Text="{Binding L[DeviceSyncDevices]}" FontWeight="SemiBold" />
+            <TextBlock Text="{Binding L[DeviceSyncNoDevices]}" IsVisible="{Binding !SyncedDevices.Count}" TextWrapping="Wrap" />
+            <ItemsControl ItemsSource="{Binding SyncedDevices}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:DeviceSyncPeerDisplay">
+                        <Border Padding="12" Margin="0,0,0,8" BorderThickness="1" CornerRadius="8" BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}">
+                            <Grid ColumnDefinitions="*,Auto">
+                                <StackPanel Spacing="4">
+                                    <TextBlock Text="{Binding Name}" FontWeight="SemiBold" />
+                                    <TextBlock Text="{Binding Status}" TextWrapping="Wrap" />
+                                    <TextBlock Text="{Binding LastSynced}" Opacity="0.7" />
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="{Binding $parent[UserControl].((vm:MainWindowViewModel)DataContext).L[DeviceSyncForget]}"
+                                        Command="{Binding $parent[UserControl].((vm:MainWindowViewModel)DataContext).ForgetSyncDeviceCommand}" CommandParameter="{Binding}" />
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <Separator />
+            <TextBlock Text="{Binding L[DeviceSyncPairHint]}" TextWrapping="Wrap" />
+            <WrapPanel>
+                <Button x:Name="LanHostButton" Content="{Binding L[DeviceSyncShowQr]}" Command="{Binding HostLanSyncCommand}" IsEnabled="{Binding !IsLanBusy}" Margin="0,0,8,0" />
+                <Button Content="{Binding L[LanReadQr]}" Command="{Binding ReadLanQrImageCommand}" IsEnabled="{Binding !IsLanBusy}" />
+            </WrapPanel>
+            <StackPanel Spacing="8" IsVisible="{Binding !!LanHostCode}">
+                <TextBlock Text="{Binding L[DeviceSyncScanOther]}" TextWrapping="Wrap" />
+                <Border Background="White" Padding="12" HorizontalAlignment="Left"><Image x:Name="LanPairingQrImage" Source="{Binding LanQrCode}" Width="300" Height="300" RenderOptions.BitmapInterpolationMode="None" /></Border>
+                <Button Content="{Binding L[LanCopyLink]}" Command="{Binding CopyLanLinkCommand}" />
+            </StackPanel>
+            <Expander x:Name="LanPairingLinkExpander" Header="{Binding L[DeviceSyncUseLink]}">
+                <StackPanel Spacing="8" Margin="0,8">
+                    <TextBox x:Name="LanInvitationBox" Text="{Binding LanInvitation}" PlaceholderText="{Binding L[LanPasteLink]}" MaxLength="512" IsEnabled="{Binding !IsLanBusy}" />
+                    <TextBlock x:Name="LanPairingReadyText" Text="{Binding L[DeviceSyncAutoFilled]}" IsVisible="{Binding LanPairingAutoFilled}" TextWrapping="Wrap" />
+                    <Button x:Name="LanConnectButton" Content="{Binding L[DeviceSyncConnect]}" Command="{Binding ConnectLanSyncCommand}" IsEnabled="{Binding !IsLanBusy}" />
+                </StackPanel>
+            </Expander>
+            <TextBlock Text="{Binding LanStatusText}" TextWrapping="Wrap" />
+            <ProgressBar x:Name="LanSyncProgress" IsVisible="{Binding IsLanBusy}" IsIndeterminate="{Binding LanProgressIndeterminate}" Value="{Binding LanProgress}" Minimum="0" Maximum="100" Height="4" />
+            <Button x:Name="LanCancelButton" Content="{Binding L.Cancel}" Command="{Binding CancelLanSyncCommand}" IsVisible="{Binding IsLanBusy}" />
+            <TextBlock Text="{Binding LanErrorText}" Foreground="{DynamicResource SystemFillColorCriticalBrush}" TextWrapping="Wrap" />
+            <Expander Header="{Binding L[DeviceSyncDiagnostics]}" IsVisible="{Binding !!LanDiagnosticText}">
+                <StackPanel Spacing="8" Margin="0,8">
+                    <SelectableTextBlock Text="{Binding LanDiagnosticText}" TextWrapping="Wrap" />
+                    <Button Content="{Binding L[DeviceSyncCopyDiagnostics]}" Command="{Binding CopyLanDiagnosticsCommand}" />
+                </StackPanel>
+            </Expander>
+            <TextBlock Text="{Binding L[DeviceSyncScope]}" TextWrapping="Wrap" Opacity="0.7" />
+        </StackPanel>
+</UserControl>

@@ -124,7 +124,7 @@ public sealed class BitwardenLocalChangeQueue(
             var identity = candidate.CipherId ?? (candidate.Entry is not null
                 ? BitwardenLocalCipherIdentity.ForPassword(candidate.Entry.Id)
                 : BitwardenLocalCipherIdentity.ForSecureItem(candidate.SecureItem!.Id));
-            await operationStore.EnqueueAsync(new BitwardenPendingOperation(
+            await operationStore.EnqueueFromScanAsync(new BitwardenPendingOperation(
                 Id: 0,
                 VaultId: vaultId,
                 CipherId: identity,

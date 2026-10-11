@@ -5,6 +5,13 @@ using Monica.Core.Services;
 
 namespace Monica.Data.Passkeys;
 
+public sealed class NativePasskeyProjection
+{
+    public long RecordId { get; set; }
+    public long DatabaseId { get; set; }
+    public string ObjectId { get; set; } = "";
+}
+
 public interface IPasskeyStore
 {
     Task<long> SaveAsync(
@@ -33,6 +40,9 @@ public interface IPasskeyStore
     Task MarkUsedAsync(long id, CancellationToken cancellationToken = default);
 
     Task<bool> DeleteAsync(long id, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<NativePasskeyProjection>> ListNativeProjectionsAsync(CancellationToken token) => Task.FromResult<IReadOnlyList<NativePasskeyProjection>>([]);
+    Task SaveNativeProjectionAsync(long recordId,long databaseId,string objectId,CancellationToken token) => Task.CompletedTask;
+    Task RemoveNativeProjectionAsync(long databaseId,string objectId,CancellationToken token) => Task.CompletedTask;
 }
 
 public sealed class PasskeyStore(
@@ -40,6 +50,27 @@ public sealed class PasskeyStore(
     IDatabaseMigrator migrator,
     IPasskeyPrivateKeyStore privateKeyStore) : IPasskeyStore
 {
+    private const string ProjectionTable = "CREATE TABLE IF NOT EXISTS device_sync_native_passkeys(database_id INTEGER NOT NULL,object_id TEXT NOT NULL,record_id INTEGER NOT NULL,PRIMARY KEY(database_id,object_id))";
+    public async Task<IReadOnlyList<NativePasskeyProjection>> ListNativeProjectionsAsync(CancellationToken token)
+    {
+        await migrator.MigrateAsync(token); await using var connection = connectionFactory.CreateConnection(); await connection.OpenAsync(token);
+        await connection.ExecuteAsync(new CommandDefinition(ProjectionTable,cancellationToken:token));
+        return (await connection.QueryAsync<NativePasskeyProjection>(new CommandDefinition(
+            "SELECT record_id AS RecordId,database_id AS DatabaseId,object_id AS ObjectId FROM device_sync_native_passkeys",cancellationToken:token))).ToArray();
+    }
+    public async Task SaveNativeProjectionAsync(long recordId,long databaseId,string objectId,CancellationToken token)
+    {
+        await migrator.MigrateAsync(token); await using var connection = connectionFactory.CreateConnection(); await connection.OpenAsync(token);
+        await connection.ExecuteAsync(new CommandDefinition(ProjectionTable,cancellationToken:token));
+        await connection.ExecuteAsync(new CommandDefinition("INSERT INTO device_sync_native_passkeys(database_id,object_id,record_id) VALUES(@DatabaseId,@ObjectId,@RecordId) ON CONFLICT(database_id,object_id) DO UPDATE SET record_id=excluded.record_id",
+            new { DatabaseId=databaseId,ObjectId=objectId,RecordId=recordId },cancellationToken:token));
+    }
+    public async Task RemoveNativeProjectionAsync(long databaseId,string objectId,CancellationToken token)
+    {
+        await migrator.MigrateAsync(token); await using var connection = connectionFactory.CreateConnection(); await connection.OpenAsync(token);
+        await connection.ExecuteAsync(new CommandDefinition(ProjectionTable,cancellationToken:token));
+        await connection.ExecuteAsync(new CommandDefinition("DELETE FROM device_sync_native_passkeys WHERE database_id=@DatabaseId AND object_id=@ObjectId",new { DatabaseId=databaseId,ObjectId=objectId },cancellationToken:token));
+    }
     private const string SelectColumns =
         """
         SELECT id AS Id,
@@ -385,6 +416,10 @@ public sealed class PasskeyStore(
             throw new ArgumentException(
                 $"A passkey needs a public key and a verifiable algorithm ({entry.PublicKeyAlgorithm}).");
         }
+
+        try { _ = PasskeyKeyMaterialGenerator.BuildCosePublicKey(entry.PublicKeyAlgorithm, entry.PublicKey); }
+        catch (Exception error) when (error is System.Security.Cryptography.CryptographicException or FormatException or ArgumentException or IOException)
+        { throw new ArgumentException("The public key does not match the passkey algorithm.", nameof(entry), error); }
 
         entry.CredentialId = PasskeyCredentialId.ToWebAuthnId(entry.CredentialId)!;
         entry.RpId = rpId;

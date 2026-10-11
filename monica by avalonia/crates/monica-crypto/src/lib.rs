@@ -4,6 +4,36 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::os::raw::c_uint;
 
+/// # Safety
+/// `input` must point to `length` readable bytes. Free the returned string once with `monica_lan_free`.
+#[no_mangle]
+pub unsafe extern "C" fn monica_lan_request(
+    input: *const u8,
+    length: usize,
+) -> *mut std::ffi::c_char {
+    let response = if input.is_null() {
+        monica_lan_sync::request_json("")
+    } else if length > monica_lan_sync::MAX_REQUEST_BYTES {
+        // Enforce the same bound as the dispatcher before dereferencing the input.
+        r#"{"ok":false,"error":"request_too_large"}"#.to_owned()
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(input, length) };
+        monica_lan_sync::request_json(std::str::from_utf8(bytes).unwrap_or(""))
+    };
+    std::ffi::CString::new(response)
+        .map(std::ffi::CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// # Safety
+/// `value` must be null or an unfreed result from `monica_lan_request`.
+#[no_mangle]
+pub unsafe extern "C" fn monica_lan_free(value: *mut std::ffi::c_char) {
+    if !value.is_null() {
+        drop(unsafe { std::ffi::CString::from_raw(value) });
+    }
+}
+
 pub const OUTPUT_LEN: usize = 32;
 
 #[repr(C)]
@@ -56,6 +86,45 @@ pub extern "C" fn monica_argon2id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lan_request_bytes(input: &[u8]) -> String {
+        let response = unsafe { monica_lan_request(input.as_ptr(), input.len()) };
+        assert!(!response.is_null());
+        let result = unsafe { std::ffi::CStr::from_ptr(response) }
+            .to_str()
+            .unwrap()
+            .to_owned();
+        unsafe { monica_lan_free(response) };
+        result
+    }
+
+    fn sized_lan_request(bytes: usize) -> Vec<u8> {
+        let prefix = br#"{"operation":"replica_close","handle":0,"padding":""#;
+        let suffix = br#""}"#;
+        let mut input = prefix.to_vec();
+        input.resize(bytes - suffix.len(), b'x');
+        input.extend_from_slice(suffix);
+        input
+    }
+
+    #[test]
+    fn lan_ffi_accepts_requests_through_the_documented_eight_mib_limit() {
+        for size in [32 * 1024 + 1, 8 * 1024 * 1024] {
+            let response = lan_request_bytes(&sized_lan_request(size));
+            assert!(
+                response.contains("\"ok\":true"),
+                "Request of {size} bytes was rejected: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn lan_ffi_reports_oversized_requests_without_changing_invalid_json_errors() {
+        let response = lan_request_bytes(&sized_lan_request(8 * 1024 * 1024 + 1));
+        assert!(response.contains("\"error\":\"request_too_large\""));
+        assert!(!response.contains("padding"));
+        assert!(lan_request_bytes(b"invalid-json").contains("\"error\":\"invalid_request\""));
+    }
 
     fn decode_hex(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);

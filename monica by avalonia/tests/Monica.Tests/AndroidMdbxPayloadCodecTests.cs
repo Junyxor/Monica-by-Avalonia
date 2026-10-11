@@ -248,7 +248,7 @@ public sealed class AndroidMdbxPayloadCodecTests
             "kind", "monica_entry_id", "room_id", "website", "username", "app_package_name",
             "app_name", "password_plain", "notes", "sort_order", "category_id", "mdbx_folder_id",
             "bound_note_room_id", "bound_note_entry_id", "login_type", "ssh_key_data",
-            "authenticator_key", "passkey_bindings", "custom_fields", "bitwarden_mode", "keepass_mode"
+            "authenticator_key", "passkey_bindings", "custom_fields", "bitwarden_mode", "keepass_mode", "is_favorite", "created_at"
         ];
         var entry = new PasswordEntry
         {

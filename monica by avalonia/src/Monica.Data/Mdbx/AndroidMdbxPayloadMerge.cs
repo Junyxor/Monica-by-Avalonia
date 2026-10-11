@@ -45,7 +45,7 @@ public static class AndroidMdbxPayloadMerge
         "password_plain", "password", "notes", "sort_order", "category_id", "mdbx_folder_id",
         "bound_note_room_id", "bound_note_entry_id", "login_type", "ssh_key_data", "authenticator_key",
         "passkey_bindings", "custom_fields", "bitwarden_mode", "keepass_mode", "deleted_at",
-        "password_history", "attachments", "is_archived", "archived_at"
+        "password_history", "attachments", "is_archived", "archived_at", "is_favorite", "created_at"
     ];
 
     /// <summary>
@@ -56,7 +56,7 @@ public static class AndroidMdbxPayloadMerge
     [
         "kind", "monica_entry_id", "room_id", "notes", "sort_order", "item_data", "image_paths",
         "category_id", "mdbx_folder_id", "bound_password_entry_id", "bitwarden_mode", "keepass_mode",
-        "deleted_at", "attachments"
+        "deleted_at", "attachments", "is_favorite", "created_at"
     ];
 
     /// <summary>

@@ -108,9 +108,9 @@ public sealed class BitwardenMutationProcessor(
                         continue;
                     }
 
-                    var failureClass = response.HttpStatusCode is { } status
+                    var failureClass = response.FailureClass ?? (response.HttpStatusCode is { } status
                         ? BitwardenRetryPolicy.ClassifyHttpStatus((HttpStatusCode)status)
-                        : BitwardenFailureClass.Permanent;
+                        : BitwardenFailureClass.Permanent);
                     if (failureClass == BitwardenFailureClass.Validation &&
                         response.HttpStatusCode is (int)HttpStatusCode.NotFound or (int)HttpStatusCode.BadRequest &&
                         operation.OperationType is BitwardenMutationOperationType.Delete
@@ -127,7 +127,8 @@ public sealed class BitwardenMutationProcessor(
                         // cipher 200, the same three routes after erasing it 400/400/400, and an id that
                         // never existed 400). Restricted to the deletions, whose request is a route plus an
                         // id with no body to get wrong, so 400 can only mean the target is absent; an
-                        // update answered 400 is a payload this client got wrong and stays a failure.
+                        // update answered 400 stays a failure unless the transport identified the
+                        // server's stale-revision response as a conflict.
                         await operationStore.CompleteAsync(operation.Id, cancellationToken);
                         completed++;
                         continue;
@@ -198,10 +199,9 @@ public sealed class BitwardenMutationProcessor(
         if (local.Passwords.TryGetValue(operation.CipherId, out var password) ||
             local.UnboundPasswords.TryGetValue(operation.CipherId, out password))
         {
-            password.BitwardenCipherId = remoteCipherId;
-            password.BitwardenRevisionDate = response.RemoteRevision ?? password.BitwardenRevisionDate;
-            password.BitwardenLocalModified = false;
-            await repository.SavePasswordAsync(password, cancellationToken);
+            await repository.TryAcknowledgeBitwardenMutationAsync(new(
+                true, password.Id, operation.VaultId, password.BitwardenCipherId,
+                remoteCipherId, response.RemoteRevision, password.MdbxDatabaseId, password.MdbxFolderId), cancellationToken);
             return;
         }
 
@@ -210,10 +210,9 @@ public sealed class BitwardenMutationProcessor(
         if (local.SecureItems.TryGetValue(operation.CipherId, out var secureItem) ||
             local.UnboundSecureItems.TryGetValue(operation.CipherId, out secureItem))
         {
-            secureItem.BitwardenCipherId = remoteCipherId;
-            secureItem.BitwardenRevisionDate = response.RemoteRevision ?? secureItem.BitwardenRevisionDate;
-            secureItem.BitwardenLocalModified = false;
-            await repository.SaveSecureItemAsync(secureItem, cancellationToken);
+            await repository.TryAcknowledgeBitwardenMutationAsync(new(
+                false, secureItem.Id, operation.VaultId, secureItem.BitwardenCipherId,
+                remoteCipherId, response.RemoteRevision, secureItem.MdbxDatabaseId, secureItem.MdbxFolderId), cancellationToken);
         }
     }
 

@@ -37,7 +37,8 @@ public interface IBitwardenConflictRestoreService
 /// </summary>
 public sealed class BitwardenConflictRestoreService(
     IMonicaRepository repository,
-    IBitwardenConflictBackupStore conflictStore) : IBitwardenConflictRestoreService
+    IBitwardenConflictBackupStore conflictStore,
+    IBitwardenPendingOperationStore operationStore) : IBitwardenConflictRestoreService
 {
     private static readonly JsonSerializerOptions PayloadOptions = new(JsonSerializerDefaults.Web);
 
@@ -109,13 +110,31 @@ public sealed class BitwardenConflictRestoreService(
             await repository.SaveSecureItemAsync(item, cancellationToken);
         }
 
+        await CompleteResolvedConflictsAsync(backup, cancellationToken);
         await conflictStore.ResolveAsync(backupId, cancellationToken);
     }
 
     public async Task DiscardAsync(long vaultId, long backupId, CancellationToken cancellationToken = default)
     {
-        await GetUnresolvedAsync(vaultId, backupId, cancellationToken);
+        var backup = await GetUnresolvedAsync(vaultId, backupId, cancellationToken);
+        await CompleteResolvedConflictsAsync(backup, cancellationToken);
         await conflictStore.ResolveAsync(backupId, cancellationToken);
+    }
+
+    private async Task CompleteResolvedConflictsAsync(BitwardenConflictBackup backup, CancellationToken cancellationToken)
+    {
+        // Only a user decision retires these blocked uploads. A subsequent drift scan can
+        // then upload restored content even if the server retained the same revision.
+        foreach (var operation in await operationStore.GetAsync(backup.VaultId, cancellationToken))
+        {
+            if (operation.CipherId == backup.CipherId && operation.Status == BitwardenMutationStatus.Conflict &&
+                operation.OperationType != BitwardenMutationOperationType.Delete &&
+                operation.ExpectedRemoteRevision == backup.LocalRevisionDate &&
+                operation.UpdatedAt <= backup.CreatedAt)
+            {
+                await operationStore.CompleteAsync(operation.Id, cancellationToken);
+            }
+        }
     }
 
     private async Task<BitwardenConflictBackup> GetUnresolvedAsync(

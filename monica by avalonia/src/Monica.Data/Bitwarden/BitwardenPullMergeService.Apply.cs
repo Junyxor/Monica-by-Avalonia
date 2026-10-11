@@ -31,6 +31,7 @@ public sealed partial class BitwardenPullMergeService
         // overwrite.
         var boundCategories = BitwardenLocalFolderProjection.BoundCategories(
             await folderStore.GetAsync(vaultId, cancellationToken));
+        var baseline = await syncStateStore.GetPayloadHashesAsync(vaultId, cancellationToken);
         var references = new List<BitwardenLocalCipherReference>(passwords.Count + secureItems.Count);
 
         foreach (var stored in passwords)
@@ -38,6 +39,7 @@ public sealed partial class BitwardenPullMergeService
             var entry = BitwardenLocalFolderProjection.Project(stored, boundCategories);
             var fields = customFields.GetValueOrDefault(entry.Id) ?? [];
             var history = histories.GetValueOrDefault(entry.Id) ?? [];
+            var payloadHash = BitwardenPayloadFingerprint.ForPassword(entry, fields, history);
             references.Add(new(
                 entry.Id,
                 entry.BitwardenCipherId!,
@@ -45,8 +47,8 @@ public sealed partial class BitwardenPullMergeService
                 entry.BitwardenRevisionDate,
                 entry.BitwardenCipherType,
                 entry.IsDeleted,
-                entry.BitwardenLocalModified,
-                BitwardenPayloadFingerprint.ForPassword(entry, fields, history),
+                entry.BitwardenLocalModified || HasLocalDrift(baseline, entry.BitwardenCipherId!, payloadHash, entry.IsDeleted),
+                payloadHash,
                 "password",
                 entry.UpdatedAt));
         }
@@ -54,6 +56,7 @@ public sealed partial class BitwardenPullMergeService
         foreach (var stored in secureItems)
         {
             var item = BitwardenLocalFolderProjection.Project(stored, boundCategories);
+            var payloadHash = BitwardenPayloadFingerprint.ForSecureItem(item);
             references.Add(new(
                 item.Id,
                 item.BitwardenCipherId!,
@@ -61,8 +64,8 @@ public sealed partial class BitwardenPullMergeService
                 item.BitwardenRevisionDate,
                 ToCipherType(item.ItemType),
                 item.IsDeleted,
-                item.BitwardenLocalModified,
-                BitwardenPayloadFingerprint.ForSecureItem(item),
+                item.BitwardenLocalModified || HasLocalDrift(baseline, item.BitwardenCipherId!, payloadHash, item.IsDeleted),
+                payloadHash,
                 "secure-item",
                 item.UpdatedAt));
         }
@@ -70,8 +73,20 @@ public sealed partial class BitwardenPullMergeService
         return new LocalContext(passwords, secureItems, customFields, histories, references);
     }
 
+    private static bool HasLocalDrift(
+        IReadOnlyDictionary<string, string> baseline,
+        string cipherId,
+        string payloadHash,
+        bool isDeleted) =>
+        baseline.TryGetValue(cipherId, out var syncedHash) &&
+        !string.Equals(syncedHash, payloadHash, StringComparison.Ordinal) &&
+        // Ordinary editor saves do not set the dirty flag. Use the same content baseline
+        // as the upload queue, including its exception for a settled remote trash entry.
+        !(isDeleted && BitwardenPayloadFingerprint.IsRemoteDeletionMarker(syncedHash));
+
     private async Task ApplyActiveRemoteAsync(
         long vaultId,
+        LocalContext local,
         long? localId,
         BitwardenDecodedCipher decoded,
         IReadOnlyDictionary<string, long> folderBindings,
@@ -85,6 +100,13 @@ public sealed partial class BitwardenPullMergeService
         {
             var entry = NormalizePassword(decoded.Password!, decoded.Metadata, vaultId, categoryId);
             entry.Id = localId ?? 0;
+            if (localId is not null && FindPassword(local, decoded.Metadata.CipherId) is { } previous)
+            {
+                // The native UUID, rather than the numeric local id, identifies the existing
+                // record. Losing it on a pull creates a duplicate instead of applying an edit.
+                entry.MdbxDatabaseId = previous.MdbxDatabaseId;
+                entry.MdbxFolderId = previous.MdbxFolderId;
+            }
             await repository.SavePasswordAsync(entry, cancellationToken);
             await repository.ReplaceCustomFieldsAsync(entry.Id, decoded.CustomFields, cancellationToken);
             await repository.ClearPasswordHistoryAsync(entry.Id, cancellationToken);
@@ -103,6 +125,12 @@ public sealed partial class BitwardenPullMergeService
 
         var item = NormalizeSecureItem(decoded.SecureItem!, decoded.Metadata, vaultId, categoryId);
         item.Id = localId ?? 0;
+        if (localId is not null)
+        {
+            var previous = FindSecureItem(local, decoded.Metadata.CipherId);
+            item.MdbxDatabaseId = previous.MdbxDatabaseId;
+            item.MdbxFolderId = previous.MdbxFolderId;
+        }
         await repository.SaveSecureItemAsync(item, cancellationToken);
     }
 
@@ -119,20 +147,14 @@ public sealed partial class BitwardenPullMergeService
         var password = FindPassword(local, decision.CipherId);
         if (password is not null)
         {
-            password.IsDeleted = true;
-            password.DeletedAt = DateTimeOffset.UtcNow;
-            password.BitwardenRevisionDate = decision.RemoteRevisionDate;
-            password.BitwardenLocalModified = false;
-            await repository.SavePasswordAsync(password, cancellationToken);
+            await repository.SoftDeletePasswordAsync(password.Id, cancellationToken);
+            await AcknowledgeAsync(password, decision.RemoteRevisionDate, cancellationToken);
             return;
         }
 
         var secureItem = FindSecureItem(local, decision.CipherId);
-        secureItem.IsDeleted = true;
-        secureItem.DeletedAt = DateTimeOffset.UtcNow;
-        secureItem.BitwardenRevisionDate = decision.RemoteRevisionDate;
-        secureItem.BitwardenLocalModified = false;
-        await repository.SaveSecureItemAsync(secureItem, cancellationToken);
+        await repository.SoftDeleteSecureItemAsync(secureItem.Id, cancellationToken);
+        await AcknowledgeAsync(secureItem, decision.RemoteRevisionDate, cancellationToken);
     }
 
     private async Task MarkLocalCleanAsync(
@@ -143,14 +165,34 @@ public sealed partial class BitwardenPullMergeService
         var password = FindPassword(local, decision.CipherId);
         if (password is not null)
         {
-            password.BitwardenLocalModified = false;
-            await repository.SavePasswordAsync(password, cancellationToken);
+            await AcknowledgeAsync(password, decision.RemoteRevisionDate, cancellationToken);
             return;
         }
 
         var item = FindSecureItem(local, decision.CipherId);
-        item.BitwardenLocalModified = false;
-        await repository.SaveSecureItemAsync(item, cancellationToken);
+        await AcknowledgeAsync(item, decision.RemoteRevisionDate, cancellationToken);
+    }
+
+    private Task<bool> AcknowledgeAsync(PasswordEntry entry, string? revision, CancellationToken token) =>
+        repository.TryAcknowledgeBitwardenMutationAsync(new(true, entry.Id, entry.BitwardenVaultId!.Value,
+            entry.BitwardenCipherId, entry.BitwardenCipherId!, revision, entry.MdbxDatabaseId, entry.MdbxFolderId), token);
+
+    private Task<bool> AcknowledgeAsync(SecureItem item, string? revision, CancellationToken token) =>
+        repository.TryAcknowledgeBitwardenMutationAsync(new(false, item.Id, item.BitwardenVaultId!.Value,
+            item.BitwardenCipherId, item.BitwardenCipherId!, revision, item.MdbxDatabaseId, item.MdbxFolderId), token);
+
+    private async Task RestoreLocalIfDeletedAsync(LocalContext local, BitwardenMergeDecision decision, CancellationToken token)
+    {
+        // Native storage owns its recycle-bin state separately from the payload. Saving an
+        // active model alone cannot restore a trashed native record.
+        if (FindPassword(local, decision.CipherId) is { } password)
+        {
+            if (password.IsDeleted) await repository.RestorePasswordAsync(password.Id, token);
+        }
+        else if (FindSecureItem(local, decision.CipherId) is { IsDeleted: true } item)
+        {
+            await repository.RestoreSecureItemAsync(item.Id, token);
+        }
     }
 
     // The two local tables number their rows independently, so resolving a row by its id alone can land

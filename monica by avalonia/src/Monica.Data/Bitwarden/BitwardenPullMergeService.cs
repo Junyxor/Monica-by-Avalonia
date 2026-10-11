@@ -84,6 +84,7 @@ public sealed partial class BitwardenPullMergeService(
                 case BitwardenMergeAction.AddRemote:
                     await ApplyActiveRemoteAsync(
                         vaultId,
+                        local,
                         null,
                         RequiredDecoded(decodedById, decision.CipherId),
                         folderBindings,
@@ -91,8 +92,10 @@ public sealed partial class BitwardenPullMergeService(
                     added++;
                     break;
                 case BitwardenMergeAction.ApplyRemoteUpdate:
+                    await RestoreLocalIfDeletedAsync(local, decision, cancellationToken);
                     await ApplyActiveRemoteAsync(
                         vaultId,
+                        local,
                         decision.LocalId,
                         RequiredDecoded(decodedById, decision.CipherId),
                         folderBindings,
@@ -113,8 +116,10 @@ public sealed partial class BitwardenPullMergeService(
                     }
                     else
                     {
+                        await RestoreLocalIfDeletedAsync(local, decision, cancellationToken);
                         await ApplyActiveRemoteAsync(
                             vaultId,
+                            local,
                             decision.LocalId,
                             RequiredDecoded(decodedById, decision.CipherId),
                             folderBindings,

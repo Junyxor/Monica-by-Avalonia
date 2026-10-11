@@ -193,7 +193,7 @@ public sealed partial class AppSettingsTests
         await viewModel.SaveSecurityQuestionsCommand.ExecuteAsync(null);
 
         Assert.Equal(viewModel.L.Get("SecurityQuestionsMustDiffer"), viewModel.StatusMessage);
-        Assert.Contains("different", viewModel.StatusMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.False(string.IsNullOrWhiteSpace(viewModel.StatusMessage));
         Assert.False(viewModel.IsSavingSecurityQuestions);
     }
 

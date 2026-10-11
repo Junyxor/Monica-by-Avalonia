@@ -128,7 +128,7 @@ public sealed record MdbxNativeVaultInfo(string VaultId, string DeviceId);
 
 public sealed record MdbxNativeProjectRecord(
     string ProjectId,
-    string Title);
+    string Title, string? ParentProjectId = null, string Guard = "", bool Deleted = false);
 
 public sealed record MdbxNativeEntryRecord(
     string EntryId,

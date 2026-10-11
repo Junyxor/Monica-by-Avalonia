@@ -15,6 +15,9 @@ The desktop application currently implements:
 - Authenticated remote vault download, bounded CipherString decoding, and local merge.
 - Nested remote folder metadata.
 - Conflict backups and retry classification for pending operations.
+- Cipher updates carry the queued baseline as `lastKnownRevisionDate`. Known
+  stale-revision HTTP 400 responses from warden-worker and Vaultwarden are
+  classified as conflicts, preserving the local edit without automatic retries.
 - A desktop account, sign-in, synchronization status, pending-change, and
   conflict workflow implemented with Avalonia views.
 
@@ -67,6 +70,23 @@ CA feature must add trust without disabling hostname verification.
 HTTP payloads, error bodies, encoded fields, and decoded fields have explicit
 size limits. Authentication and synchronization failures publish sanitized
 messages instead of raw tokens, passwords, or server payloads.
+
+Update revision guards supplement the existing preflight read; they do not make
+the server's check and write atomic or remove its timestamp tolerance. Unrelated
+HTTP 400 responses retain their validation semantics.
+
+Automatic drift scans preserve the retry or conflict state of an identical
+mutation. Explicit retry and conflict resolution remain separate user decisions.
+Pull conflict detection compares local content with its synchronized fingerprint,
+including edits whose legacy dirty flag is false.
+
+Successful mutations acknowledge only the server binding and revision through
+the repository. They do not save the old full entity captured before HTTP. The
+SQLite update is scoped to the expected vault/cipher identity, and the native
+read/identity check/metadata patch holds one store lease. Neither acknowledgement
+creates a missing item. Canonical payloads retain the Bitwarden binding and native
+UUID; legacy payloads are updated in their existing envelopes. Native trash state
+is changed through the trash/restore APIs rather than a model boolean alone.
 
 ## KDF and CipherString limits
 

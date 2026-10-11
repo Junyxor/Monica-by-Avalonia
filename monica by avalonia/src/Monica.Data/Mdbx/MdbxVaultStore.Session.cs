@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Nodes;
 using Monica.Core.Models;
 
 namespace Monica.Data.Mdbx;
@@ -224,7 +225,7 @@ public sealed partial class MdbxVaultStore
         return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, sessionToken);
     }
 
-    private sealed class MdbxVaultLease : IMdbxNativeVault, IMdbxNativeObjectReader
+    private sealed class MdbxVaultLease : IMdbxNativeVault, IMdbxNativeObjectReader, IMdbxNativeLanSync, IMdbxNativeDevicePasswordAccess
     {
         private readonly IMdbxNativeVault _vault;
         private MdbxVaultStore? _owner;
@@ -239,6 +240,51 @@ public sealed partial class MdbxVaultStore
         // The lease wraps whatever the format gate handed back, so the restriction travels with it.
         public bool IsReadOnly => _vault.IsReadOnly;
         public bool SupportsObjectDisclosure => (_vault as IMdbxNativeObjectReader)?.SupportsObjectDisclosure ?? false;
+
+        public Task<MdbxLanBundle> ExportLanBundleAsync(string destination, CancellationToken cancellationToken) =>
+            RequireLanSync().ExportLanBundleAsync(destination, cancellationToken);
+
+        public Task<MdbxLanMerge> ApplyLanBundleAsync(string source, CancellationToken cancellationToken) =>
+            RequireLanSync().ApplyLanBundleAsync(source, cancellationToken);
+
+        public Task<string> GetLanRevisionAsync(CancellationToken cancellationToken) =>
+            RequireLanSync().GetLanRevisionAsync(cancellationToken);
+
+        public Task<IReadOnlyList<MdbxNativeProjectRecord>> ListDeviceSyncProjectsAsync(CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ListDeviceSyncProjectsAsync(token);
+
+        public Task<MdbxNativeEntryRecord?> ReadDeviceSyncObjectAsync(MdbxNativeObjectSummary summary, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ReadDeviceSyncObjectAsync(summary, token);
+        public Task<System.Text.Json.Nodes.JsonArray> ReadDeviceSyncLabelsAsync(string id, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ReadDeviceSyncLabelsAsync(id, token);
+        public Task<System.Text.Json.Nodes.JsonArray> ReadDeviceSyncProjectTagsAsync(string id, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ReadDeviceSyncProjectTagsAsync(id, token);
+        public Task<System.Text.Json.Nodes.JsonArray> ReadDeviceSyncRelationsAsync(string id, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ReadDeviceSyncRelationsAsync(id, token);
+        public Task ResolveDeviceSyncRelationsAsync(CancellationToken token, IReadOnlyDictionary<string,string>? targets = null) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ResolveDeviceSyncRelationsAsync(token,targets);
+        public Task<IReadOnlyList<DevicePasswordSnapshot>> ReadDeviceSyncRootMetadataAsync(CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ReadDeviceSyncRootMetadataAsync(token);
+        public Task<string?> ApplyDeviceSyncRootMetadataAsync(string owner,string? expected,bool newBinding,bool deleted,JsonObject data,CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ApplyDeviceSyncRootMetadataAsync(owner,expected,newBinding,deleted,data,token);
+        public Task<string> GetDeviceSyncGuardAsync(string id, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).GetDeviceSyncGuardAsync(id, token);
+        public Task<MdbxNativeObjectSummary?> CommitDeviceSyncObjectAsync(DeviceVaultWritePlan plan, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).CommitDeviceSyncObjectAsync(plan, token);
+
+        public Task<string?> ApplyDeviceSyncFolderAsync(string id, string? guard, bool newBinding, bool deleted, System.Text.Json.Nodes.JsonObject data, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).ApplyDeviceSyncFolderAsync(id, guard, newBinding, deleted, data, token);
+        public Task EnsureDeviceSyncFoldersAsync(System.Text.Json.Nodes.JsonArray path, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).EnsureDeviceSyncFoldersAsync(path, token);
+
+        public Task<MdbxNativeObjectSummary?> GetDeviceSyncSummaryAsync(string id, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).GetDeviceSyncSummaryAsync(id, token);
+
+        public Task<MdbxNativeEntryRecord> CreateDeviceSyncEntryAsync(string id, string project, string type, string title, string payload, CancellationToken token) =>
+            ((IMdbxNativeDevicePasswordAccess)_vault).CreateDeviceSyncEntryAsync(id, project, type, title, payload, token);
+
+        private IMdbxNativeLanSync RequireLanSync() => !IsReadOnly && _vault is IMdbxNativeLanSync sync
+            ? sync : throw new NotSupportedException("LAN synchronization is unavailable for this vault.");
 
         public Task<MdbxNativeVaultInfo> GetInfoAsync(CancellationToken cancellationToken = default) =>
             _vault.GetInfoAsync(cancellationToken);

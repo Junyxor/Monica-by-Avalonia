@@ -1,4 +1,8 @@
 using System.Security.Cryptography;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
+using Org.BouncyCastle.Security;
+using Org.BouncyCastle.X509;
 
 namespace Monica.Core.Passkeys;
 
@@ -18,6 +22,12 @@ public sealed record CosePublicKey(
 {
     public string ToSubjectPublicKeyInfoBase64()
     {
+        if (KeyType == PasskeyAlgorithm.OkpKeyType && Algorithm == PasskeyAlgorithm.EdDsa)
+        {
+            if (XCoordinate is not { Length: 32 }) throw new CryptographicException("An Ed25519 key must contain 32 bytes.");
+            return Convert.ToBase64String(SubjectPublicKeyInfoFactory.CreateSubjectPublicKeyInfo(
+                new Ed25519PublicKeyParameters(XCoordinate)).GetEncoded());
+        }
         using var key = ToAsymmetricAlgorithm();
         return Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
     }
@@ -28,7 +38,7 @@ public sealed record CosePublicKey(
         {
             return ToSubjectPublicKeyInfoBase64() == spkiBase64;
         }
-        catch (CryptographicException)
+        catch (Exception error) when (error is CryptographicException or FormatException or ArgumentException or IOException)
         {
             return false;
         }
@@ -81,7 +91,9 @@ public static class PasskeyAlgorithm
 
     public const int Ec2KeyType = 2;
     public const int RsaKeyType = 3;
+    public const int OkpKeyType = 1;
     public const int P256Curve = 1;
+    public const int Ed25519Curve = 6;
 
     public const int LabelKeyType = 1;
     public const int LabelAlgorithm = 3;
@@ -95,7 +107,7 @@ public static class PasskeyAlgorithm
     // imported from elsewhere can still be verified.
     public static bool CanGenerate(int algorithm) => algorithm is Es256 or Rs256;
 
-    public static bool CanVerify(int algorithm) => algorithm is Es256 or Rs256 or Ps256;
+    public static bool CanVerify(int algorithm) => algorithm is Es256 or Rs256 or Ps256 or EdDsa;
 
     public static string Describe(int algorithm) => algorithm switch
     {
@@ -126,25 +138,39 @@ public static class PasskeyKeyMaterialGenerator
 
     public static byte[] Sign(int algorithm, string privateKeyPkcs8Base64, byte[] payload)
     {
-        if (!PasskeyAlgorithm.CanGenerate(algorithm))
+        if (!PasskeyAlgorithm.CanVerify(algorithm))
         {
             throw new NotSupportedException(
                 $"Monica's passkey authenticator cannot sign with {PasskeyAlgorithm.Describe(algorithm)}.");
         }
 
         var pkcs8 = Convert.FromBase64String(privateKeyPkcs8Base64);
-        if (algorithm == PasskeyAlgorithm.Es256)
+        try
         {
-            using var ec = ECDsa.Create();
-            ec.ImportPkcs8PrivateKey(pkcs8, out _);
-            // WebAuthn §6.5.5 requires ASN.1 DER for ES256 assertion signatures. COSE's
-            // fixed-width r || s representation describes a different wire format.
-            return ec.SignData(payload, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+            if (algorithm == PasskeyAlgorithm.EdDsa)
+            {
+                if (PrivateKeyFactory.CreateKey(pkcs8) is not Ed25519PrivateKeyParameters key)
+                    throw new CryptographicException("The private key does not match Ed25519.");
+                var signer = new Ed25519Signer();
+                signer.Init(true, key);
+                signer.BlockUpdate(payload, 0, payload.Length);
+                return signer.GenerateSignature();
+            }
+            if (algorithm == PasskeyAlgorithm.Es256)
+            {
+                using var ec = ECDsa.Create();
+                ec.ImportPkcs8PrivateKey(pkcs8, out var consumed);
+                if (consumed != pkcs8.Length) throw new CryptographicException("Trailing private-key data is not permitted.");
+                // WebAuthn ES256 assertions use ASN.1 DER, not fixed-width r || s.
+                return ec.SignData(payload, HashAlgorithmName.SHA256, DSASignatureFormat.Rfc3279DerSequence);
+            }
+            using var rsa = RSA.Create();
+            rsa.ImportPkcs8PrivateKey(pkcs8, out var rsaConsumed);
+            if (rsaConsumed != pkcs8.Length) throw new CryptographicException("Trailing private-key data is not permitted.");
+            return rsa.SignData(payload, HashAlgorithmName.SHA256,
+                algorithm == PasskeyAlgorithm.Ps256 ? RSASignaturePadding.Pss : RSASignaturePadding.Pkcs1);
         }
-
-        using var rsa = RSA.Create();
-        rsa.ImportPkcs8PrivateKey(pkcs8, out _);
-        return rsa.SignData(payload, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        finally { CryptographicOperations.ZeroMemory(pkcs8); }
     }
 
     public static bool Verify(
@@ -161,6 +187,14 @@ public static class PasskeyKeyMaterialGenerator
         try
         {
             var subjectPublicKeyInfo = Convert.FromBase64String(publicKeySpkiBase64);
+            if (algorithm == PasskeyAlgorithm.EdDsa)
+            {
+                if (PublicKeyFactory.CreateKey(subjectPublicKeyInfo) is not Ed25519PublicKeyParameters key) return false;
+                var verifier = new Ed25519Signer();
+                verifier.Init(false, key);
+                verifier.BlockUpdate(payload, 0, payload.Length);
+                return verifier.VerifySignature(signature.ToArray());
+            }
             if (algorithm == PasskeyAlgorithm.Es256)
             {
                 using var ec = ECDsa.Create();
@@ -190,7 +224,7 @@ public static class PasskeyKeyMaterialGenerator
                 HashAlgorithmName.SHA256,
                 algorithm == PasskeyAlgorithm.Ps256 ? RSASignaturePadding.Pss : RSASignaturePadding.Pkcs1);
         }
-        catch (Exception error) when (error is CryptographicException or FormatException or ArgumentException)
+        catch (Exception error) when (error is CryptographicException or FormatException or ArgumentException or IOException)
         {
             // Invalid imported keys and malformed signatures fail the bool verification boundary.
             return false;
@@ -200,6 +234,17 @@ public static class PasskeyKeyMaterialGenerator
     public static byte[] BuildCosePublicKey(int algorithm, string publicKeySpkiBase64)
     {
         var subjectPublicKeyInfo = Convert.FromBase64String(publicKeySpkiBase64);
+        if (algorithm == PasskeyAlgorithm.EdDsa)
+        {
+            if (PublicKeyFactory.CreateKey(subjectPublicKeyInfo) is not Ed25519PublicKeyParameters key)
+                throw new CryptographicException("The public key does not match Ed25519.");
+            return new CborBuilder().WriteStartMap(4)
+                .WriteInteger(PasskeyAlgorithm.LabelKeyType).WriteInteger(PasskeyAlgorithm.OkpKeyType)
+                .WriteInteger(PasskeyAlgorithm.LabelAlgorithm).WriteInteger(algorithm)
+                .WriteInteger(PasskeyAlgorithm.LabelCurve).WriteInteger(PasskeyAlgorithm.Ed25519Curve)
+                .WriteInteger(PasskeyAlgorithm.LabelXCoordinate).WriteByteString(key.GetEncoded()).Build();
+        }
+        if (!PasskeyAlgorithm.CanVerify(algorithm)) throw new NotSupportedException("Unsupported passkey algorithm.");
         if (algorithm is PasskeyAlgorithm.Es256)
         {
             using var ec = ECDsa.Create();
@@ -269,13 +314,21 @@ public static class PasskeyKeyMaterialGenerator
             parsed = keyType switch
             {
                 PasskeyAlgorithm.Ec2KeyType
-                    when TryBytes(values, PasskeyAlgorithm.LabelXCoordinate, out var x) &&
-                         TryBytes(values, PasskeyAlgorithm.LabelYCoordinate, out var y) =>
+                    when algorithm == PasskeyAlgorithm.Es256 &&
+                         values.TryGetValue(PasskeyAlgorithm.LabelCurve, out var curve) && curve.AsInteger() == PasskeyAlgorithm.P256Curve &&
+                         TryBytes(values, PasskeyAlgorithm.LabelXCoordinate, out var x) && x is { Length: 32 } &&
+                         TryBytes(values, PasskeyAlgorithm.LabelYCoordinate, out var y) && y is { Length: 32 } =>
                     new CosePublicKey(keyType, algorithm, x, y, null, null),
                 PasskeyAlgorithm.RsaKeyType
-                    when TryBytes(values, PasskeyAlgorithm.LabelModulus, out var modulus) &&
+                    when algorithm is PasskeyAlgorithm.Rs256 or PasskeyAlgorithm.Ps256 &&
+                         TryBytes(values, PasskeyAlgorithm.LabelModulus, out var modulus) &&
                          TryBytes(values, PasskeyAlgorithm.LabelExponent, out var exponent) =>
                     new CosePublicKey(keyType, algorithm, null, null, modulus, exponent),
+                PasskeyAlgorithm.OkpKeyType
+                    when algorithm == PasskeyAlgorithm.EdDsa &&
+                         values.TryGetValue(PasskeyAlgorithm.LabelCurve, out var edCurve) && edCurve.AsInteger() == PasskeyAlgorithm.Ed25519Curve &&
+                         TryBytes(values, PasskeyAlgorithm.LabelXCoordinate, out var edX) && edX is { Length: 32 } =>
+                    new CosePublicKey(keyType, algorithm, edX, null, null, null),
                 _ => null
             };
             if (parsed is null)
