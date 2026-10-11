@@ -1,10 +1,35 @@
 using System.Text;
+using Monica.App.Services;
+using Monica.Core.Models;
 using Monica.Core.Passkeys;
 
 namespace Monica.Tests;
 
 public sealed class PortablePasskeyAlgorithmTests
 {
+    [Theory]
+    [InlineData(PasskeyAlgorithm.Es256)]
+    [InlineData(PasskeyAlgorithm.Rs256)]
+    [InlineData(PasskeyAlgorithm.Ps256)]
+    public void Android_registration_spki_can_be_received_and_used(int algorithm)
+    {
+        var material = PasskeyKeyMaterialGenerator.Generate(
+            algorithm == PasskeyAlgorithm.Ps256 ? PasskeyAlgorithm.Rs256 : algorithm);
+        var entry = new PasskeyEntry
+        {
+            CredentialId = "synthetic-credential", RpId = "example.test", RpName = "Android registration",
+            UserId = "Zml4dHVyZQ==", PublicKeyAlgorithm = algorithm, PublicKey = material.PublicKeySpkiBase64
+        };
+        var data = DevicePasskeyShape.Export(entry, material.PrivateKeyPkcs8Base64);
+        // Android registration keeps SPKI in its store and in the sync payload.
+        data["payload"]!["public_key"] = material.PublicKeySpkiBase64;
+        var imported = DevicePasskeyShape.Import(data, 1);
+        Assert.Equal(material.PublicKeySpkiBase64, imported.PublicKey);
+        var challenge = Encoding.UTF8.GetBytes("synthetic Android SPKI sync challenge");
+        Assert.True(PasskeyKeyMaterialGenerator.Verify(algorithm, imported.PublicKey, challenge,
+            PasskeyKeyMaterialGenerator.Sign(algorithm, imported.PrivateKeyAlias, challenge)));
+    }
+
     [Fact]
     public void Imported_rsa_pss_key_can_sign_after_synchronization()
     {
