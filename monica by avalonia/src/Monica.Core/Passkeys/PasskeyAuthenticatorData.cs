@@ -45,7 +45,18 @@ public static class PasskeyAuthenticatorDataCodec
 
     private const int HeaderLength = 32 + 1 + 4;
 
-    public static byte[] BuildAssertion(string rpId, int signCount) => BuildHeader(rpId, AssertionFlags, signCount);
+    public static PasskeyAuthenticatorFlags ResolveAssertionFlags(bool? backupEligible, bool? backupState)
+    {
+        var eligible = backupEligible ?? true;
+        var state = backupState ?? eligible;
+        if (!eligible && state) throw new ArgumentException("Invalid WebAuthn backup flags");
+        return PasskeyAuthenticatorFlags.UserPresent | PasskeyAuthenticatorFlags.UserVerified
+            | (eligible ? PasskeyAuthenticatorFlags.BackupEligible : PasskeyAuthenticatorFlags.None)
+            | (state ? PasskeyAuthenticatorFlags.BackupState : PasskeyAuthenticatorFlags.None);
+    }
+
+    public static byte[] BuildAssertion(string rpId, int signCount, bool? backupEligible = null, bool? backupState = null) =>
+        BuildHeader(rpId, ResolveAssertionFlags(backupEligible, backupState), signCount);
 
     public static byte[] BuildCreation(
         string rpId,

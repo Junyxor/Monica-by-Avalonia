@@ -79,7 +79,8 @@ public static class PasskeyAuthenticator
         string? origin = null)
     {
         var resolvedRpId = rpId ?? credential.RpId;
-        var authenticatorData = PasskeyAuthenticatorDataCodec.BuildAssertion(resolvedRpId, signCount: 0);
+        var authenticatorData = PasskeyAuthenticatorDataCodec.BuildAssertion(resolvedRpId, signCount: 0,
+            credential.BackupEligible, credential.BackupState);
         var clientData = PasskeyClientData.Build(
             PasskeyClientData.AssertionType,
             challenge,

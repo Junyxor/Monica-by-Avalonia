@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using Monica.Core.Models;
 using Monica.Core.Passkeys;
 using Monica.Data.Mdbx;
+using Monica.Platform.Services;
 
 namespace Monica.App.Services;
 
@@ -27,7 +28,8 @@ internal static class DevicePasskeyShape
             ["created_at"] = entry.CreatedAt.ToUnixTimeMilliseconds(), ["last_used_at"] = entry.LastUsedAt.ToUnixTimeMilliseconds(),
             ["use_count"] = entry.UseCount, ["icon_url"] = entry.IconUrl, ["is_discoverable"] = entry.IsDiscoverable,
             ["is_user_verification_required"] = entry.IsUserVerificationRequired, ["transports"] = entry.Transports,
-            ["aaguid"] = entry.Aaguid, ["sign_count"] = 0, ["notes"] = entry.Notes, ["passkey_mode"] = entry.PasskeyMode
+            ["aaguid"] = entry.Aaguid, ["sign_count"] = 0, ["notes"] = entry.Notes, ["passkey_mode"] = entry.PasskeyMode,
+            ["backup_eligible"] = entry.BackupEligible, ["backup_state"] = entry.BackupState
         };
         var data = DeviceVaultShape.Normalize(payload.ToJsonString(), entry.RpName, "", "passkey");
         data["folder_path"] = new JsonArray(); data["labels"] = new JsonArray(); data["relations"] = new JsonArray(); data["assets"] = new JsonArray(); data["trashed"] = false;
@@ -72,8 +74,50 @@ internal static class DevicePasskeyShape
             IsUserVerificationRequired = Flag("is_user_verification_required"), SignCount = 0, IsBackedUp = Text("key_status") == "portable",
             CreatedAt = DateTimeOffset.FromUnixTimeMilliseconds(p["created_at"]?.GetValue<long>() ?? 0),
             LastUsedAt = DateTimeOffset.FromUnixTimeMilliseconds(p["last_used_at"]?.GetValue<long>() ?? 0), UseCount = p["use_count"]?.GetValue<int>() ?? 0,
-            IconUrl = Text("icon_url")
+            IconUrl = Text("icon_url"),
+            BackupEligible = p["backup_eligible"]?.GetValue<bool>(), BackupState = p["backup_state"]?.GetValue<bool>()
         };
+    }
+
+    public static void ValidateIdentity(PasskeyEntry previous, JsonObject payload)
+    {
+        var algorithm = payload["public_key_algorithm"]!.GetValue<int>();
+        try
+        {
+            byte[] Canonical(string value)
+            {
+                var bytes = Convert.FromBase64String(value);
+                if (PasskeyKeyMaterialGenerator.TryParseCosePublicKey(bytes, out var cose, out var read) && read == bytes.Length)
+                {
+                    if (cose!.Algorithm != algorithm) throw new LanSyncException("passkey_conflict");
+                    value = cose.ToSubjectPublicKeyInfoBase64();
+                }
+                return PasskeyKeyMaterialGenerator.BuildCosePublicKey(algorithm, value);
+            }
+            if (previous.PublicKeyAlgorithm != algorithm ||
+                PasskeyCredentialId.Normalize(previous.CredentialId) != PasskeyCredentialId.Normalize(payload["credential_id"]!.GetValue<string>()) ||
+                !previous.RpId.Equals(payload["rp_id"]!.GetValue<string>(), StringComparison.OrdinalIgnoreCase) ||
+                !CryptographicOperations.FixedTimeEquals(Canonical(previous.PublicKey), Canonical(payload["public_key"]!.GetValue<string>())))
+                throw new LanSyncException("passkey_conflict");
+        }
+        catch (Exception error) when (error is CryptographicException or FormatException or ArgumentException or NotSupportedException)
+        { throw new LanSyncException("passkey_conflict"); }
+    }
+
+    public static void PreserveExisting(PasskeyEntry entry, PasskeyEntry previous, JsonObject payload)
+    {
+        ValidateIdentity(previous, payload);
+        if (entry.BackupEligible is not null && entry.BackupEligible != (previous.BackupEligible ?? true))
+            throw new LanSyncException("passkey_conflict");
+        entry.BackupEligible ??= previous.BackupEligible;
+        entry.BackupState ??= previous.BackupState;
+        _ = PasskeyAuthenticatorDataCodec.ResolveAssertionFlags(entry.BackupEligible, entry.BackupState);
+        if (entry.PrivateKeyAlias.Length == 0)
+        {
+            entry.PrivateKeyAlias = previous.PrivateKeyAlias;
+            entry.IsBackedUp = previous.IsBackedUp;
+            entry.SyncStatus = previous.SyncStatus;
+        }
     }
 
     public static string Guard(JsonObject data) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Canonical(data).ToJsonString())));

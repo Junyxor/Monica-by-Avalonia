@@ -87,7 +87,20 @@ public sealed class DevicePasswordSyncProvider(
             data["folder"] = category?.Name ?? "";
             var saved = LanSyncNative.Request(new { operation = "replica_local", handle = _replica, local_ids = new[] { $"passkey:{entry.Id}" }, include_data = true }).GetProperty("items");
             if(saved.GetArrayLength() > 0 && saved[0].GetProperty("data").ValueKind == JsonValueKind.Object)
-                data = MergePasskeyData(JsonNode.Parse(saved[0].GetProperty("data").GetRawText())!.AsObject(), data);
+            {
+                var oldData = JsonNode.Parse(saved[0].GetProperty("data").GetRawText())!.AsObject();
+                var oldPayload = oldData["payload"]!.AsObject();
+                DevicePasskeyShape.ValidateIdentity(entry, oldPayload);
+                var eligibility = entry.BackupEligible ?? oldPayload["backup_eligible"]?.GetValue<bool>();
+                var state = entry.BackupState ?? oldPayload["backup_state"]?.GetValue<bool>();
+                if (eligibility != entry.BackupEligible || state != entry.BackupState)
+                {
+                    entry.BackupEligible = eligibility; entry.BackupState = state;
+                    await passkeys.SaveAsync(entry, entry.PrivateKeyAlias, token);
+                    data["payload"]!["backup_eligible"] = eligibility; data["payload"]!["backup_state"] = state;
+                }
+                data = MergePasskeyData(oldData, data);
+            }
             if (passwordRows.FirstOrDefault(p => p.Id == entry.BoundPasswordId)?.ReplicaGroupId is { Length: > 0 } bound)
                 data["payload"]!["bound_password_entry_id"] = bound;
             if (category?.MdbxFolderId is { } folderId && passwords.FirstOrDefault(p => p.GlobalId == folderId && p.Data["entry_type"]?.GetValue<string>() == "folder") is { } folder)
@@ -225,7 +238,11 @@ public sealed class DevicePasswordSyncProvider(
     {
         var result = previous.DeepClone().AsObject();
         var payload = result["payload"] as JsonObject ?? new JsonObject();
-        foreach(var pair in current["payload"]!.AsObject()) payload[pair.Key] = pair.Value?.DeepClone();
+        foreach(var pair in current["payload"]!.AsObject())
+        {
+            if (pair.Key is "backup_eligible" or "backup_state" && pair.Value is null && payload[pair.Key] is not null) continue;
+            payload[pair.Key] = pair.Value?.DeepClone();
+        }
         result["payload"] = payload;
         foreach(var pair in current.Where(p => p.Key != "payload")) if(pair.Key is not ("labels" or "relations" or "assets" or "trashed") || !result.ContainsKey(pair.Key))
             result[pair.Key] = pair.Value?.DeepClone();
@@ -406,7 +423,7 @@ public sealed class DevicePasswordSyncProvider(
         }
     }
 
-    private async Task<DevicePasswordSnapshot?> ApplyPasskeyAsync(string globalId, string? localId, string? expected, bool deleted, JsonObject data, CancellationToken token)
+    internal async Task<DevicePasswordSnapshot?> ApplyPasskeyAsync(string globalId, string? localId, string? expected, bool deleted, JsonObject data, CancellationToken token)
     {
         var store = passkeys ?? throw new LanSyncException("passkeys_not_ready");
         var id = localId is not null && localId.StartsWith("passkey:", StringComparison.Ordinal) ? long.Parse(localId.AsSpan(8)) : 0;
@@ -422,7 +439,7 @@ public sealed class DevicePasswordSyncProvider(
             return new($"passkey:{id}", globalId, "passkeys", "", true, new JsonObject());
         }
         var entry = DevicePasskeyShape.Import(data, id);
-        if(previous is not null && entry.PrivateKeyAlias.Length == 0 && entry.PublicKey == previous.PublicKey) entry.PrivateKeyAlias = previous.PrivateKeyAlias;
+        if(previous is not null) DevicePasskeyShape.PreserveExisting(entry, previous, data["payload"]!.AsObject());
         var duplicate = await store.FindAsync(entry.CredentialId, entry.RpId, token);
         if (duplicate is not null && duplicate.Id != id)
         {
@@ -482,7 +499,7 @@ public sealed class DevicePasswordSyncProvider(
         }
     }
 
-    private async Task ProjectNativePasskeysAsync(CancellationToken token,IReadOnlyList<DevicePasswordSnapshot>? supplied = null)
+    internal async Task ProjectNativePasskeysAsync(CancellationToken token,IReadOnlyList<DevicePasswordSnapshot>? supplied = null)
     {
         if(passkeys is null) return;
         var all = supplied ?? await ReadNativePasskeysAsync(token);
@@ -498,14 +515,29 @@ public sealed class DevicePasswordSyncProvider(
             if(!key && rowId == 0) continue;
             var row = rowId == 0 ? null : await passkeys.GetAsync(rowId,token);
             if(key && snapshot.Data["payload"]?["credential_id"] is { } credential) row ??= await passkeys.FindAsync(credential.GetValue<string>(),snapshot.Data["payload"]!["rp_id"]?.GetValue<string>(),token);
-            if(!snapshot.KeyProjectionPending && row is not null && !snapshot.Deleted && LanSyncNative.Request(new {
+            var originalGuard = row is null ? null : KeyGuard(row);
+            var payload = snapshot.Data["payload"] as JsonObject;
+            var hydrateFlags = row is not null && payload is not null &&
+                ((row.BackupEligible is null && payload["backup_eligible"] is not null) ||
+                 (row.BackupState is null && payload["backup_state"] is not null));
+            if(!hydrateFlags && !snapshot.KeyProjectionPending && row is not null && !snapshot.Deleted && LanSyncNative.Request(new {
                 operation="replica_local",handle=_replica,local_ids=new[] { snapshot.LocalId } }).GetProperty("items").GetArrayLength() > 0) continue;
             var physical = snapshot.LocalId.Split(':',3)[2];
             if(snapshot.Deleted) { if(row is not null) await passkeys.DeleteAsync(row.Id,token); await vaults.CompleteDeviceSyncKeyProjectionAsync(database,physical,token);
                 await passkeys.RemoveNativeProjectionAsync(database.Id,physical,token); continue; }
             await NormalizeNativePasskeyAsync(snapshot.Data,token);
             var entry = DevicePasskeyShape.Import(snapshot.Data,row?.Id ?? 0);
-            if(row is not null && (row.PublicKey != entry.PublicKey || row.PublicKeyAlgorithm != entry.PublicKeyAlgorithm)) throw new LanSyncException("passkey_conflict");
+            if(row is not null)
+            {
+                DevicePasskeyShape.ValidateIdentity(row, snapshot.Data["payload"]!.AsObject());
+                // Existing native payload is authoritative for a projection made before these columns existed.
+                if (row.MdbxDatabaseId == database.Id)
+                {
+                    row.BackupEligible ??= entry.BackupEligible;
+                    row.BackupState ??= entry.BackupState;
+                }
+                DevicePasskeyShape.PreserveExisting(entry, row, snapshot.Data["payload"]!.AsObject());
+            }
             var material = entry.PrivateKeyAlias;
             entry.MdbxDatabaseId = database.Id;
             entry.MdbxFolderId = snapshot.Data["folder_path"]?.AsArray().LastOrDefault()?["id"]?.GetValue<string>();
@@ -515,7 +547,7 @@ public sealed class DevicePasswordSyncProvider(
                 if(material.Length == 0 && row.PublicKey == entry.PublicKey) { entry.PrivateKeyAlias = row.PrivateKeyAlias; material = row.PrivateKeyAlias; } }
             if(row is not null && await passkeys.ResolvePrivateKeyAsync(row,token) == material) {
                 entry.PrivateKeyAlias = row.PrivateKeyAlias;
-                if(KeyGuard(entry) == KeyGuard(row)) { await vaults.CompleteDeviceSyncKeyProjectionAsync(database,physical,token);
+                if(KeyGuard(entry) == originalGuard) { await vaults.CompleteDeviceSyncKeyProjectionAsync(database,physical,token);
                     await passkeys.SaveNativeProjectionAsync(row.Id,database.Id,physical,token); continue; }
             }
             var id = await passkeys.SaveAsync(entry,material,token);

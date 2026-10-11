@@ -96,6 +96,8 @@ public sealed class PasskeyService(
             CreatedAt = now,
             LastUsedAt = now,
             Aaguid = PasskeyAuthenticator.MonicaAaguidText,
+            BackupEligible = true,
+            BackupState = true,
             IsDiscoverable = request.IsDiscoverable,
             IsUserVerificationRequired = request.IsUserVerificationRequired,
             CategoryId = request.CategoryId,

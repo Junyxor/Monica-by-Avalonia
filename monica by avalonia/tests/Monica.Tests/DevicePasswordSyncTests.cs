@@ -18,6 +18,82 @@ namespace Monica.Tests;
 public sealed class DevicePasswordSyncTests
 {
     [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Standalone_reference_update_retains_keys_and_flags_or_rejects_changed_identity(bool differentKey)
+    {
+        await using var fixture = await Fixture.CreateAsync();
+        var material = PasskeyKeyMaterialGenerator.Generate(PasskeyAlgorithm.Es256);
+        var entry = new PasskeyEntry { CredentialId = Guid.NewGuid().ToString(), RpId = "example.test", RpName = "Reference fixture",
+            UserId = "Zml4dHVyZQ==", PublicKey = material.PublicKeySpkiBase64, BackupEligible = false, BackupState = false };
+        await fixture.Passkeys.SaveAsync(entry, material.PrivateKeyPkcs8Base64);
+        var previous = (await fixture.Passkeys.GetAsync(entry.Id))!;
+        var data = DevicePasskeyShape.Export(previous, null, verify: false);
+        data["payload"]!.AsObject().Remove("backup_eligible"); data["payload"]!.AsObject().Remove("backup_state");
+        data["payload"]!["public_key"] = differentKey ? PasskeyKeyMaterialGenerator.Generate(PasskeyAlgorithm.Es256).PublicKeySpkiBase64 : material.PublicKeySpkiBase64;
+        var guard = Convert.ToHexString(SHA256.HashData(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(previous)));
+        var update = () => fixture.Provider.ApplyPasskeyAsync(DevicePasskeyShape.Identity(previous), $"passkey:{previous.Id}", guard,
+            false, data, CancellationToken.None);
+        if (differentKey) Assert.Equal("passkey_conflict", (await Assert.ThrowsAsync<LanSyncException>(update)).Code);
+        else Assert.NotNull(await update());
+        var retained = (await fixture.Passkeys.GetAsync(previous.Id))!;
+        Assert.Equal(material.PrivateKeyPkcs8Base64, await fixture.Passkeys.ResolvePrivateKeyAsync(retained));
+        Assert.Equal(previous.PublicKey, retained.PublicKey);
+        Assert.Equal(false, retained.BackupEligible);
+        Assert.Equal(false, retained.BackupState);
+    }
+
+    [Theory]
+    [InlineData(false, false, 0x05)]
+    [InlineData(true, false, 0x0d)]
+    [InlineData(true, true, 0x1d)]
+    [InlineData(null, null, 0x1d)]
+    public async Task Native_passkey_backup_flags_survive_projection_and_real_assertion(bool? eligible, bool? state, int flags)
+    {
+        await using var first = await Fixture.CreateAsync();
+        await using var second = await Fixture.CreateAsync();
+        var material = PasskeyKeyMaterialGenerator.Generate(PasskeyAlgorithm.Es256);
+        var entry = new PasskeyEntry { CredentialId = Guid.NewGuid().ToString(), RpId = "example.test", RpName = "Backup flag fixture",
+            UserId = "Zml4dHVyZQ==", PublicKey = material.PublicKeySpkiBase64 };
+        var payload = DevicePasskeyShape.Export(entry, material.PrivateKeyPkcs8Base64)["payload"]!.AsObject();
+        payload["backup_eligible"] = eligible; payload["backup_state"] = state;
+        var bridge = new MdbxUniffiNativeBridge();
+        using (var vault = await bridge.OpenVaultAsync(first.Database.FilePath, first.Database.EncryptedPassword!, "backup-flag-fixture"))
+        {
+            var access = (IMdbxNativeDevicePasswordAccess)vault;
+            await access.EnsureDeviceSyncFoldersAsync(new JsonArray(), CancellationToken.None);
+            var root = (await access.ListDeviceSyncProjectsAsync(CancellationToken.None)).Single(p => MdbxAndroidRoot.IsRootTitle(p.Title));
+            await access.CreateDeviceSyncEntryAsync(Guid.NewGuid().ToString(), root.ProjectId, "passkey", "Backup flag fixture", payload.ToJsonString(), CancellationToken.None);
+        }
+        await ExchangeAsync(first, second);
+        var received = Assert.Single(await second.Passkeys.ListAllAsync());
+        var privateKey = await second.Passkeys.ResolvePrivateKeyAsync(received);
+        var challenge = RandomNumberGenerator.GetBytes(32);
+        var assertion = PasskeyAuthenticator.Assert(received, privateKey!, challenge);
+        Assert.Equal(flags, assertion.AuthenticatorData[32]);
+        Assert.True(PasskeyKeyMaterialGenerator.Verify(received.PublicKeyAlgorithm, received.PublicKey,
+            assertion.AuthenticatorData.Concat(assertion.ClientData.ClientDataHash).ToArray(), assertion.Signature));
+        if (eligible is not null || state is not null)
+        {
+            // Emulate a projection written before these nullable columns existed.
+            await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder {
+                DataSource = Path.Combine(Path.GetDirectoryName(second.Database.FilePath)!, "metadata.db") }.ToString());
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE passkeys SET backup_eligible=NULL,backup_state=NULL WHERE id=@id";
+            command.Parameters.AddWithValue("@id", received.Id);
+            await command.ExecuteNonQueryAsync();
+            Assert.Null((await second.Passkeys.GetAsync(received.Id))!.BackupEligible);
+            await second.Provider.ProjectNativePasskeysAsync(CancellationToken.None,
+                await second.Vaults.ReadDevicePasswordsAsync(second.Database, CancellationToken.None));
+            var restored = (await second.Passkeys.GetAsync(received.Id))!;
+            Assert.Equal(eligible, restored.BackupEligible);
+            Assert.Equal(state, restored.BackupState);
+            Assert.Equal(flags, PasskeyAuthenticator.Assert(restored, privateKey!, challenge).AuthenticatorData[32]);
+        }
+    }
+
+    [Theory]
     [InlineData(PasskeyAlgorithm.Es256)]
     [InlineData(PasskeyAlgorithm.Rs256)]
     [InlineData(PasskeyAlgorithm.Ps256)]

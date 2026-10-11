@@ -93,6 +93,8 @@ public sealed class PasskeyStore(
                aaguid AS Aaguid,
                sign_count AS SignCount,
                is_backed_up AS IsBackedUp,
+               backup_eligible AS BackupEligible,
+               backup_state AS BackupState,
                notes AS Notes,
                bound_password_id AS BoundPasswordId,
                category_id AS CategoryId,
@@ -145,6 +147,15 @@ public sealed class PasskeyStore(
         {
             throw new InvalidOperationException("The passkey being updated no longer exists.");
         }
+        if (existing is not null)
+        {
+            var oldEligibility = existing.BackupEligible is null ? (bool?)null : existing.BackupEligible != 0;
+            if (oldEligibility is not null && entry.BackupEligible is not null && oldEligibility != entry.BackupEligible)
+                throw new InvalidDataException("passkey_conflict");
+            entry.BackupEligible ??= oldEligibility;
+            entry.BackupState ??= existing.BackupState is null ? null : existing.BackupState != 0;
+        }
+        _ = PasskeyAuthenticatorDataCodec.ResolveAssertionFlags(entry.BackupEligible, entry.BackupState);
 
         var duplicate = await connection.QueryFirstOrDefaultAsync<PasskeyRow>(new CommandDefinition(
             SelectDuplicate,
@@ -329,14 +340,14 @@ public sealed class PasskeyStore(
             credential_id, rp_id, rp_name, user_id, user_name, user_display_name,
             public_key_algorithm, public_key, private_key_alias, created_at, last_used_at, use_count,
             icon_url, is_discoverable, is_user_verification_required, transports, aaguid, sign_count,
-            is_backed_up, notes, bound_password_id, category_id, keepass_database_id, keepass_group_path,
+            is_backed_up, backup_eligible, backup_state, notes, bound_password_id, category_id, keepass_database_id, keepass_group_path,
             mdbx_database_id, mdbx_folder_id, bitwarden_vault_id, bitwarden_folder_id, bitwarden_cipher_id,
             sync_status, passkey_mode)
         VALUES (
             @CredentialId, @RpId, @RpName, @UserId, @UserName, @UserDisplayName,
             @PublicKeyAlgorithm, @PublicKey, @PrivateKeyAlias, @CreatedAt, @LastUsedAt, @UseCount,
             @IconUrl, @IsDiscoverable, @IsUserVerificationRequired, @Transports, @Aaguid, @SignCount,
-            @IsBackedUp, @Notes, @BoundPasswordId, @CategoryId, @KeepassDatabaseId, @KeepassGroupPath,
+            @IsBackedUp, @BackupEligible, @BackupState, @Notes, @BoundPasswordId, @CategoryId, @KeepassDatabaseId, @KeepassGroupPath,
             @MdbxDatabaseId, @MdbxFolderId, @BitwardenVaultId, @BitwardenFolderId, @BitwardenCipherId,
             @SyncStatus, @PasskeyMode);
         """;
@@ -353,6 +364,7 @@ public sealed class PasskeyStore(
             use_count = MAX(use_count, @UseCount), icon_url = @IconUrl, is_discoverable = @IsDiscoverable,
             is_user_verification_required = @IsUserVerificationRequired, transports = @Transports,
             aaguid = @Aaguid, sign_count = @SignCount, is_backed_up = @IsBackedUp, notes = @Notes,
+            backup_eligible = @BackupEligible, backup_state = @BackupState,
             bound_password_id = @BoundPasswordId, category_id = @CategoryId,
             keepass_database_id = @KeepassDatabaseId, keepass_group_path = @KeepassGroupPath,
             mdbx_database_id = @MdbxDatabaseId, mdbx_folder_id = @MdbxFolderId,
@@ -384,6 +396,8 @@ public sealed class PasskeyStore(
         entry.Aaguid,
         entry.SignCount,
         IsBackedUp = entry.IsBackedUp ? 1 : 0,
+        BackupEligible = entry.BackupEligible is null ? (int?)null : entry.BackupEligible.Value ? 1 : 0,
+        BackupState = entry.BackupState is null ? (int?)null : entry.BackupState.Value ? 1 : 0,
         entry.Notes,
         entry.BoundPasswordId,
         entry.CategoryId,
@@ -447,6 +461,8 @@ public sealed class PasskeyStore(
         public string Aaguid { get; init; } = "";
         public long SignCount { get; init; }
         public int IsBackedUp { get; init; }
+        public int? BackupEligible { get; init; }
+        public int? BackupState { get; init; }
         public string Notes { get; init; } = "";
         public long? BoundPasswordId { get; init; }
         public long? CategoryId { get; init; }
@@ -482,6 +498,8 @@ public sealed class PasskeyStore(
             Aaguid = Aaguid,
             SignCount = SignCount,
             IsBackedUp = IsBackedUp != 0,
+            BackupEligible = BackupEligible is null ? null : BackupEligible != 0,
+            BackupState = BackupState is null ? null : BackupState != 0,
             Notes = Notes,
             BoundPasswordId = BoundPasswordId,
             CategoryId = CategoryId,

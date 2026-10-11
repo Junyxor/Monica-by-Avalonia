@@ -35,6 +35,8 @@ public sealed class DatabaseMigrator(ISqliteConnectionFactory connectionFactory)
         await CreateTablesAsync(connection, cancellationToken);
         await EnsurePasswordQuickAccessTableWithoutForeignKeyAsync(connection, cancellationToken);
         await EnsureColumnAsync(connection, "categories", "mdbx_folder_id", "TEXT DEFAULT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "passkeys", "backup_eligible", "INTEGER DEFAULT NULL", cancellationToken);
+        await EnsureColumnAsync(connection, "passkeys", "backup_state", "INTEGER DEFAULT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "categories", "parent_category_id", "INTEGER DEFAULT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "categories", "bitwarden_vault_id", "INTEGER DEFAULT NULL", cancellationToken);
         await EnsureColumnAsync(connection, "categories", "bitwarden_folder_id", "TEXT DEFAULT NULL", cancellationToken);
@@ -365,6 +367,8 @@ public sealed class DatabaseMigrator(ISqliteConnectionFactory connectionFactory)
             aaguid TEXT NOT NULL DEFAULT '',
             sign_count INTEGER NOT NULL DEFAULT 0,
             is_backed_up INTEGER NOT NULL DEFAULT 0,
+            backup_eligible INTEGER DEFAULT NULL,
+            backup_state INTEGER DEFAULT NULL,
             notes TEXT NOT NULL DEFAULT '',
             bound_password_id INTEGER DEFAULT NULL,
             category_id INTEGER DEFAULT NULL,
