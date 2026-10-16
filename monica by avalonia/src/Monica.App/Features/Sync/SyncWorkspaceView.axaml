@@ -6,8 +6,8 @@
         <Border x:Name="SyncOperationsCommandSurface" BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}" BorderThickness="0,0,0,1" Padding="0,0,0,14" Margin="0,0,0,8">
             <Grid x:Name="SyncHeaderGrid" ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="8">
                 <TextBlock Classes="workspacePageTitle" Text="{Binding L.SyncAndBackup}" />
-                <TextBlock Grid.Row="1" Classes="workspacePageSubtitle" Text="{Binding L.SyncSubtitle}" MaxWidth="620" HorizontalAlignment="Left" />
-                <sync:SyncCommandBarView x:Name="SyncCommandBar" Grid.Column="1" Grid.RowSpan="2" />
+                <TextBlock Grid.Row="1" Classes="workspacePageSubtitle" Text="{Binding L.SyncSubtitle}" MaxWidth="620" HorizontalAlignment="Left" IsVisible="{Binding !IsSyncDevicesSelected}" />
+                <sync:SyncCommandBarView x:Name="SyncCommandBar" Grid.Column="1" Grid.RowSpan="2" IsVisible="{Binding !IsSyncDevicesSelected}" />
                 <Border x:Name="WebDavOperationProgressRegion"
                         Grid.Row="2"
                         Grid.ColumnSpan="2"
@@ -61,6 +61,12 @@
                     <StackPanel Spacing="14">
                         <StackPanel Spacing="8">
                             <TextBlock Classes="workspaceSectionLabel" Text="{Binding L.SyncAndBackup}" />
+                            <Button x:Name="NearbyDevicesNavigationButton" Classes="workspaceNavItem" Classes.selected="{Binding IsSyncDevicesSelected}" Command="{Binding SelectSyncPageCommand}" CommandParameter="Devices">
+                                <StackPanel Orientation="Horizontal" Spacing="10">
+                                    <ic:FluentIcon Icon="Phone" FontSize="17" />
+                                    <TextBlock Text="{Binding L[LanTitle]}" />
+                                </StackPanel>
+                            </Button>
                             <Button Classes="workspaceNavItem" Classes.selected="{Binding IsSyncConfigurationSelected}" Command="{Binding SelectSyncPageCommand}" CommandParameter="Configuration">
                                 <StackPanel Orientation="Horizontal" Spacing="10">
                                     <ic:FluentIcon Icon="ArrowSync" FontSize="17" />

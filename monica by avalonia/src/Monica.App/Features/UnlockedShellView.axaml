@@ -7,7 +7,7 @@
              x:Class="Monica.App.Features.UnlockedShellView"
              x:DataType="vm:MainWindowViewModel">
 
-    <Grid RowDefinitions="*,28">
+    <Grid RowDefinitions="*,Auto">
         <fa:FANavigationView x:Name="VaultNavigationView"
                              Grid.Row="0"
                              PaneDisplayMode="LeftCompact"
@@ -40,15 +40,18 @@
         <Border Grid.Row="1"
                 BorderBrush="{DynamicResource DividerStrokeColorDefaultBrush}"
                 BorderThickness="0,1,0,0">
-            <StackPanel Orientation="Horizontal"
-                        Spacing="16"
-                        Margin="12,0"
+            <StackPanel Spacing="4"
+                        Margin="12,5"
                         VerticalAlignment="Center"
                         ClipToBounds="True">
                 <TextBlock Text="{Binding StatusMessage}"
                            FontSize="{DynamicResource FontSizeMeta}"
                            Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                            TextTrimming="CharacterEllipsis" />
+                <StackPanel Spacing="4" IsVisible="{Binding IsDeletingPasswords}">
+                    <TextBlock Text="{Binding PasswordDeleteProgressText}" />
+                    <ProgressBar Minimum="0" Maximum="{Binding PasswordDeleteTotal}" Value="{Binding PasswordDeleteProcessed}" Height="4" />
+                </StackPanel>
             </StackPanel>
         </Border>
 

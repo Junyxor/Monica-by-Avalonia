@@ -89,6 +89,8 @@ public sealed class PasskeyEntry
     public string Aaguid { get; set; } = "";
     public long SignCount { get; set; }
     public bool IsBackedUp { get; set; }
+    public bool? BackupEligible { get; set; }
+    public bool? BackupState { get; set; }
     public string Notes { get; set; } = "";
     public long? BoundPasswordId { get; set; }
     public long? CategoryId { get; set; }

@@ -61,6 +61,8 @@ public static class AndroidMdbxPayloadCodec
             writer.WriteString("password_plain", entry.Password ?? "");
             writer.WriteString("notes", entry.Notes ?? "");
             writer.WriteNumber("sort_order", entry.SortOrder);
+            writer.WriteBoolean("is_favorite", entry.IsFavorite);
+            WriteOptionalUnixMilliseconds(writer, "created_at", entry.CreatedAt);
             WriteOptionalNumber(writer, "category_id", entry.CategoryId);
             WriteOptionalString(writer, "mdbx_folder_id", NormalizeMdbxFolderId(folderId));
             WriteOptionalNumber(writer, "bound_note_room_id", entry.BoundNoteId);
@@ -90,6 +92,9 @@ public static class AndroidMdbxPayloadCodec
             writer.WriteEndArray();
             writer.WriteBoolean("bitwarden_mode", entry.BitwardenVaultId is not null);
             writer.WriteBoolean("keepass_mode", entry.KeepassDatabaseId is not null);
+            WriteBitwardenBinding(writer, entry.BitwardenVaultId, entry.BitwardenCipherId, entry.BitwardenFolderId,
+                entry.BitwardenRevisionDate, entry.BitwardenLocalModified, entry.BitwardenCipherType,
+                entry.DeletedAt == DateTimeOffset.UnixEpoch);
 
             // Avalonia-only compatibility extensions stay flat and are ignored by Android.
             // They preserve current desktop history/attachment behavior until those features
@@ -121,6 +126,22 @@ public static class AndroidMdbxPayloadCodec
         return Encoding.UTF8.GetString(stream.ToArray());
     }
 
+    private static void WriteBitwardenBinding(
+        Utf8JsonWriter writer, long? vaultId, string? cipherId, string? folderId,
+        string? revision, bool localModified, int? cipherType, bool purged)
+    {
+        if (vaultId is null && !purged) return;
+        // The mode flag alone cannot identify the server item on the next read. Keep the
+        // binding alongside the content, and explicitly clear it for permanent tombstones.
+        if (purged) writer.WriteNull("bitwarden_vault_id");
+        else writer.WriteNumber("bitwarden_vault_id", vaultId!.Value);
+        writer.WriteString("bitwarden_cipher_id", purged ? null : cipherId);
+        writer.WriteString("bitwarden_folder_id", purged ? null : folderId);
+        writer.WriteString("bitwarden_revision_date", purged ? null : revision);
+        writer.WriteBoolean("bitwarden_local_modified", !purged && localModified);
+        if (cipherType is { } type) writer.WriteNumber("bitwarden_cipher_type", type);
+    }
+
     public static AndroidMdbxPasswordPayload? DecodePassword(string payloadJson, string recordTitle)
     {
         try
@@ -146,6 +167,8 @@ public static class AndroidMdbxPayloadCodec
                 Password = GetPasswordPlain(root),
                 Notes = GetString(root, "notes"),
                 SortOrder = checked((int)(GetInt64(root, "sort_order", "sortOrder") ?? 0)),
+                IsFavorite = GetBoolean(root, "is_favorite", "isFavorite"),
+                CreatedAt = GetDateTimeOffset(root, "created_at", "createdAt") ?? DateTimeOffset.UtcNow,
                 CategoryId = GetInt64(root, "category_id", "categoryId"),
                 MdbxFolderId = NormalizeMdbxFolderId(GetNullableString(root, "mdbx_folder_id", "mdbxFolderId")),
                 ReplicaGroupId = NormalizeOptionalText(GetNullableString(root, "monica_entry_id", "monicaEntryId")),
@@ -156,7 +179,13 @@ public static class AndroidMdbxPayloadCodec
                 LoginType = ParseLoginType(GetString(root, "login_type", "loginType")),
                 SshKeyData = GetMdbxSshKeyData(root),
                 AuthenticatorKey = GetString(root, "authenticator_key", "authenticatorKey"),
-                PasskeyBindings = GetString(root, "passkey_bindings", "passkeyBindings")
+                PasskeyBindings = GetString(root, "passkey_bindings", "passkeyBindings"),
+                BitwardenVaultId = GetInt64(root, "bitwarden_vault_id", "bitwardenVaultId"),
+                BitwardenCipherId = GetNullableString(root, "bitwarden_cipher_id", "bitwardenCipherId"),
+                BitwardenFolderId = GetNullableString(root, "bitwarden_folder_id", "bitwardenFolderId"),
+                BitwardenRevisionDate = GetNullableString(root, "bitwarden_revision_date", "bitwardenRevisionDate"),
+                BitwardenLocalModified = GetBoolean(root, "bitwarden_local_modified", "bitwardenLocalModified"),
+                BitwardenCipherType = checked((int)(GetInt64(root, "bitwarden_cipher_type", "bitwardenCipherType") ?? 1))
             };
 
             var customFields = DecodeCustomFields(root, entryId);
@@ -202,6 +231,8 @@ public static class AndroidMdbxPayloadCodec
             writer.WriteNumber("room_id", item.Id);
             writer.WriteString("notes", item.Notes ?? "");
             writer.WriteNumber("sort_order", item.SortOrder);
+            writer.WriteBoolean("is_favorite", item.IsFavorite);
+            WriteOptionalUnixMilliseconds(writer, "created_at", item.CreatedAt);
             writer.WriteString("item_data", item.ItemData ?? "");
             writer.WriteString("image_paths", item.ImagePaths ?? "[]");
             WriteOptionalNumber(writer, "category_id", item.CategoryId);
@@ -209,6 +240,9 @@ public static class AndroidMdbxPayloadCodec
             WriteOptionalString(writer, "bound_password_entry_id", boundPasswordEntryId);
             writer.WriteBoolean("bitwarden_mode", item.BitwardenVaultId is not null);
             writer.WriteBoolean("keepass_mode", item.KeepassDatabaseId is not null);
+            WriteBitwardenBinding(writer, item.BitwardenVaultId, item.BitwardenCipherId, item.BitwardenFolderId,
+                item.BitwardenRevisionDate, item.BitwardenLocalModified, null,
+                item.DeletedAt == DateTimeOffset.UnixEpoch);
             WriteOptionalUnixMilliseconds(writer, "deleted_at", item.DeletedAt);
             if (attachments is not null)
             {
@@ -249,12 +283,19 @@ public static class AndroidMdbxPayloadCodec
                 Title = recordTitle ?? "",
                 Notes = GetString(root, "notes"),
                 SortOrder = checked((int)(GetInt64(root, "sort_order", "sortOrder") ?? 0)),
+                IsFavorite = GetBoolean(root, "is_favorite", "isFavorite"),
+                CreatedAt = GetDateTimeOffset(root, "created_at", "createdAt") ?? DateTimeOffset.UtcNow,
                 ItemData = GetString(root, "item_data", "itemData"),
                 ImagePaths = GetPreferredString(root, "image_paths", "imagePaths", "[]"),
                 CategoryId = GetInt64(root, "category_id", "categoryId"),
                 MdbxFolderId = NormalizeMdbxFolderId(GetNullableString(root, "mdbx_folder_id", "mdbxFolderId")),
                 ReplicaGroupId = NormalizeOptionalText(GetNullableString(root, "monica_entry_id", "monicaEntryId")),
-                DeletedAt = GetDateTimeOffset(root, "deleted_at", "deletedAt")
+                DeletedAt = GetDateTimeOffset(root, "deleted_at", "deletedAt"),
+                BitwardenVaultId = GetInt64(root, "bitwarden_vault_id", "bitwardenVaultId"),
+                BitwardenCipherId = GetNullableString(root, "bitwarden_cipher_id", "bitwardenCipherId"),
+                BitwardenFolderId = GetNullableString(root, "bitwarden_folder_id", "bitwardenFolderId"),
+                BitwardenRevisionDate = GetNullableString(root, "bitwarden_revision_date", "bitwardenRevisionDate"),
+                BitwardenLocalModified = GetBoolean(root, "bitwarden_local_modified", "bitwardenLocalModified")
             };
 
             return new AndroidMdbxSecureItemPayload(

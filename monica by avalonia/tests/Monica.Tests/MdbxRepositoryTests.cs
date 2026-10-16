@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Monica.App.ViewModels;
+using Monica.Core.Bitwarden;
 using Monica.Core.Models;
 using Monica.Core.Services;
 using Monica.Data;
@@ -11,6 +12,97 @@ namespace Monica.Tests;
 
 public sealed class MdbxRepositoryTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_acknowledgement_keeps_new_identity_and_rejects_rebound_or_purged_items(bool password)
+    {
+        var repository = CreateRepository(out _);
+        await SaveDefaultMdbxDatabaseAsync(repository);
+        BitwardenMutationAcknowledgement acknowledgement;
+        if (password)
+        {
+            var staleEditor = new PasswordEntry { Title = "New login", Password = "synthetic", BitwardenVaultId = 17 };
+            await repository.SavePasswordAsync(staleEditor);
+            acknowledgement = new(true, staleEditor.Id, 17, null, "assigned-cipher", "r1", staleEditor.MdbxDatabaseId, staleEditor.MdbxFolderId);
+            Assert.True(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement));
+            staleEditor.Title = "Edited from the old form";
+            await repository.SavePasswordAsync(staleEditor);
+            var current = Assert.Single(await repository.GetPasswordsAsync());
+            Assert.Equal("assigned-cipher", current.BitwardenCipherId);
+            Assert.Equal("r1", current.BitwardenRevisionDate);
+            current.BitwardenVaultId = 18;
+            current.BitwardenCipherId = "other-cipher";
+            await repository.SavePasswordAsync(current);
+            Assert.False(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement with { ExpectedCipherId = "assigned-cipher", Revision = "r2" }));
+            await repository.DeletePasswordPermanentlyAsync(current.Id);
+            Assert.False(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement with { VaultId = 18, ExpectedCipherId = "other-cipher" }));
+            Assert.Empty(await repository.GetPasswordsAsync());
+            Assert.Null(Assert.Single(await repository.GetPasswordsAsync(true, true)).BitwardenCipherId);
+        }
+        else
+        {
+            var staleEditor = new SecureItem { Title = "New note", ItemType = VaultItemType.Note, ItemData = "{}", BitwardenVaultId = 17 };
+            await repository.SaveSecureItemAsync(staleEditor);
+            acknowledgement = new(false, staleEditor.Id, 17, null, "assigned-cipher", "r1", staleEditor.MdbxDatabaseId, staleEditor.MdbxFolderId);
+            Assert.True(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement));
+            staleEditor.Title = "Edited from the old form";
+            await repository.SaveSecureItemAsync(staleEditor);
+            var current = Assert.Single(await repository.GetSecureItemsAsync());
+            Assert.Equal("assigned-cipher", current.BitwardenCipherId);
+            Assert.Equal("r1", current.BitwardenRevisionDate);
+            current.BitwardenVaultId = 18;
+            current.BitwardenCipherId = "other-cipher";
+            await repository.SaveSecureItemAsync(current);
+            Assert.False(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement with { ExpectedCipherId = "assigned-cipher", Revision = "r2" }));
+            await repository.DeleteSecureItemPermanentlyAsync(current.Id);
+            Assert.False(await repository.TryAcknowledgeBitwardenMutationAsync(acknowledgement with { VaultId = 18, ExpectedCipherId = "other-cipher" }));
+            Assert.Empty(await repository.GetSecureItemsAsync());
+            Assert.Null(Assert.Single(await repository.GetSecureItemsAsync(includeDeleted: true)).BitwardenCipherId);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Review_canonical_storage_preserves_bitwarden_binding_and_revision(bool password)
+    {
+        var repository = CreateRepository(out _);
+        await SaveDefaultMdbxDatabaseAsync(repository);
+        if (password)
+        {
+            var entry = new PasswordEntry
+            {
+                Title = "Bound login", Password = "synthetic secret", BitwardenVaultId = 17,
+                BitwardenCipherId = "cipher-login", BitwardenFolderId = "folder", BitwardenCipherType = 1,
+                BitwardenRevisionDate = "r1", BitwardenLocalModified = true
+            };
+            await repository.SavePasswordAsync(entry);
+            var read = Assert.Single(await repository.GetPasswordsAsync());
+            Assert.Equal(17, read.BitwardenVaultId);
+            Assert.Equal("cipher-login", read.BitwardenCipherId);
+            Assert.Equal("folder", read.BitwardenFolderId);
+            Assert.Equal("r1", read.BitwardenRevisionDate);
+            Assert.True(read.BitwardenLocalModified);
+        }
+        else
+        {
+            var item = new SecureItem
+            {
+                Title = "Bound note", ItemType = VaultItemType.Note, ItemData = "{}", BitwardenVaultId = 17,
+                BitwardenCipherId = "cipher-note", BitwardenFolderId = "folder",
+                BitwardenRevisionDate = "r1", BitwardenLocalModified = true
+            };
+            await repository.SaveSecureItemAsync(item);
+            var read = Assert.Single(await repository.GetSecureItemsAsync());
+            Assert.Equal(17, read.BitwardenVaultId);
+            Assert.Equal("cipher-note", read.BitwardenCipherId);
+            Assert.Equal("folder", read.BitwardenFolderId);
+            Assert.Equal("r1", read.BitwardenRevisionDate);
+            Assert.True(read.BitwardenLocalModified);
+        }
+    }
+
     [Fact]
     public void Canonical_repository_reports_embedded_attachment_persistence()
     {
@@ -862,6 +954,41 @@ public sealed class MdbxRepositoryTests
         Assert.Equal(SyncStatus.PendingUpload, persisted.LastSyncStatus);
         Assert.Null(persisted.LastSyncError);
         Assert.Equal(previousSyncedAt, persisted.LastSyncedAt);
+    }
+
+    [Theory]
+    [InlineData(MdbxStorageLocation.RemoteWebDav, "REMOTE_WEBDAV")]
+    [InlineData(MdbxStorageLocation.RemoteOneDrive, "REMOTE_ONEDRIVE")]
+    public async Task Lan_sync_preserves_cloud_validators_and_marks_received_changes_pending(MdbxStorageLocation location, string source)
+    {
+        var repository = CreateRepository(out _);
+        var database = await SaveDefaultMdbxDatabaseAsync(repository, location, source);
+        database.LastSyncStatus = SyncStatus.Synced;
+        database.LastSyncError = "old diagnostic";
+        database.LastSyncedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await repository.SaveMdbxDatabaseAsync(database);
+        var previousSyncedAt = Assert.Single(await repository.GetMdbxDatabasesAsync()).LastSyncedAt;
+
+        await Assert.IsAssignableFrom<IMdbxLanSyncMutationObserver>(repository).OnLanSyncAppliedAsync(database);
+
+        var persisted = Assert.Single(await repository.GetMdbxDatabasesAsync());
+        Assert.Equal(SyncStatus.PendingUpload, persisted.LastSyncStatus);
+        Assert.Null(persisted.LastSyncError);
+        Assert.Equal(previousSyncedAt, persisted.LastSyncedAt);
+    }
+
+    [Fact]
+    public async Task Lan_sync_invalidates_folder_cache_as_well_as_passwords()
+    {
+        var repository = CreateRepository(out var bridge);
+        var database = await SaveDefaultMdbxDatabaseAsync(repository);
+        Assert.Empty(await repository.GetCategoriesAsync());
+        using var externalWriter = new MdbxVaultStore(bridge);
+        await externalWriter.SaveCategoryAsync(database, new Category { Name = "Folder from peer" });
+
+        await Assert.IsAssignableFrom<IMdbxLanSyncMutationObserver>(repository).OnLanSyncAppliedAsync(database);
+
+        Assert.Contains(await repository.GetCategoriesAsync(), category => category.Name == "Folder from peer");
     }
 
     [Fact]

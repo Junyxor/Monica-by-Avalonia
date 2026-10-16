@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using Dapper;
+using Monica.Core.Bitwarden;
 using Monica.Core.Models;
 using Monica.Data.Services;
 
@@ -12,6 +13,8 @@ public sealed record PasswordMetadataSearchResult(
 public interface IMonicaRepository
 {
     bool PersistsAttachmentContent => false;
+    Task<bool> TryAcknowledgeBitwardenMutationAsync(BitwardenMutationAcknowledgement acknowledgement, CancellationToken cancellationToken = default) =>
+        Task.FromException<bool>(new NotSupportedException("Atomic Bitwarden acknowledgement is unavailable."));
     Task<IReadOnlyList<PasswordEntry>> GetPasswordsAsync(bool includeDeleted = false, bool includeArchived = false, CancellationToken cancellationToken = default);
     Task<long> SavePasswordAsync(PasswordEntry entry, CancellationToken cancellationToken = default);
     Task SoftDeletePasswordAsync(long id, CancellationToken cancellationToken = default);

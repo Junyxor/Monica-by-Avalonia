@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Monica.Core.Bitwarden;
 using Monica.Core.Models;
 using Monica.Core.Services;
 using Monica.Data.Repositories;
@@ -10,6 +11,8 @@ namespace Monica.Data.Mdbx;
 public interface IMdbxVaultStore
 {
     bool IsAvailable { get; }
+    Task<bool> TryAcknowledgeBitwardenMutationAsync(LocalMdbxDatabase database, BitwardenMutationAcknowledgement acknowledgement, CancellationToken cancellationToken = default) =>
+        Task.FromException<bool>(new NotSupportedException("Atomic Bitwarden acknowledgement is unavailable."));
     Task<IReadOnlyList<Category>> GetCategoriesAsync(LocalMdbxDatabase database, CancellationToken cancellationToken = default);
     Task<Category> SaveCategoryAsync(LocalMdbxDatabase database, Category category, CancellationToken cancellationToken = default);
     Task<PasswordEntry> SavePasswordAsync(LocalMdbxDatabase database, PasswordEntry entry, CancellationToken cancellationToken = default);
@@ -164,14 +167,23 @@ public sealed partial class MdbxVaultStore(
     {
         var vault = await OpenAsync(database, cancellationToken);
         using var _ = vault;
-        if (!string.IsNullOrWhiteSpace(entry.MdbxFolderId))
-        {
-            await FindEntryAsync(vault, entry.MdbxFolderId, PasswordEntryTypes, includeDeleted: true, cancellationToken);
-        }
+        var existing = await FindEntryAsync(vault, entry.MdbxFolderId!, PasswordEntryTypes, includeDeleted: true, cancellationToken);
 
         var project = await ResolveProjectAsync(vault, entry.CategoryId, categories, cancellationToken);
         var entryType = PasswordEntryType;
         var portableEntry = ClonePasswordEntryForPayload(entry);
+        if (existing is not null && portableEntry.DeletedAt != DateTimeOffset.UnixEpoch &&
+            DeserializePasswordPayload(existing.PayloadJson, existing.Title)?.Entry is { } previous)
+        {
+            if (portableEntry.BitwardenVaultId is null)
+            {
+                portableEntry.BitwardenFolderId ??= previous.BitwardenFolderId;
+                portableEntry.BitwardenCipherType = previous.BitwardenCipherType;
+            }
+            portableEntry.BitwardenVaultId ??= previous.BitwardenVaultId;
+            portableEntry.BitwardenCipherId ??= previous.BitwardenCipherId;
+            portableEntry.BitwardenRevisionDate ??= previous.BitwardenRevisionDate;
+        }
         portableEntry.Password = ToPortableSensitiveValue(portableEntry.Password);
         portableEntry.AuthenticatorKey = ToPortableSensitiveValue(portableEntry.AuthenticatorKey);
         var portableFields = NormalizeCustomFields(entry.Id, customFields)
@@ -189,13 +201,16 @@ public sealed partial class MdbxVaultStore(
             })
             .ToList();
         var boundNoteEntryId = await ResolveSecureItemEntryIdAsync(vault, entry.BoundNoteId, "note", cancellationToken);
-        var payload = AndroidMdbxPayloadCodec.EncodePassword(
+        var portableAttachments = NormalizeAttachments(entry.Id, attachments).ToList();
+        var payload = RewriteLegacyPayload(existing, "entry", portableEntry.Id, portableEntry,
+            [("customFields", portableFields), ("passwordHistory", portableHistory), ("attachments", portableAttachments)])
+            ?? AndroidMdbxPayloadCodec.EncodePassword(
             portableEntry,
             portableFields,
             await PayloadFolderIdAsync(vault, project, cancellationToken),
             boundNoteEntryId,
             portableHistory,
-            NormalizeAttachments(entry.Id, attachments).ToList());
+            portableAttachments);
         var record = await SaveEntryAsync(
             vault,
             project.ProjectId,
@@ -457,12 +472,22 @@ public sealed partial class MdbxVaultStore(
                      .OrderBy(item => item.Record.Deleted))
         {
             var payload = item.Payload!;
-            if (!ids.Contains(payload.Entry.Id) || payload.Attachments is null || result.ContainsKey(payload.Entry.Id))
+            if (!ids.Contains(payload.Entry.Id) || result.ContainsKey(payload.Entry.Id))
             {
                 continue;
             }
 
-            result[payload.Entry.Id] = NormalizeAttachments(payload.Entry.Id, payload.Attachments).ToList();
+            var nativeAttachments = (await vault.ListAttachmentsAsync(item.Record.ProjectId, item.Record.EntryId, cancellationToken)).Where(a => !a.Deleted).ToArray();
+            var syncAssets = item.Record.PayloadJson.Contains("\"device_sync_assets\"", StringComparison.Ordinal);
+            if(!syncAssets && payload.Attachments is { Count: > 0 })
+                result[payload.Entry.Id] = NormalizeAttachments(payload.Entry.Id,payload.Attachments).ToList();
+            else if(nativeAttachments.Length > 0)
+            {
+                var attachments = NormalizeSecureItemNativeAttachments(payload.Entry.Id, nativeAttachments).ToArray();
+                foreach(var attachment in attachments) attachment.OwnerType = "PASSWORD";
+                result[payload.Entry.Id] = attachments;
+            }
+            else result[payload.Entry.Id] = [];
         }
 
         return result;
@@ -571,21 +596,29 @@ public sealed partial class MdbxVaultStore(
     {
         var vault = await OpenAsync(database, cancellationToken);
         using var _ = vault;
-        if (!string.IsNullOrWhiteSpace(item.MdbxFolderId))
-        {
-            await FindEntryAsync(vault, item.MdbxFolderId, SecureEntryTypes, includeDeleted: true, cancellationToken);
-        }
+        var existing = await FindEntryAsync(vault, item.MdbxFolderId!, SecureEntryTypes, includeDeleted: true, cancellationToken);
 
         var project = await ResolveProjectAsync(vault, item.CategoryId, categories, cancellationToken);
         var entryType = ToMdbxEntryType(item.ItemType);
         var portableItem = CloneSecureItemForPayload(item);
+        if (existing is not null && portableItem.DeletedAt != DateTimeOffset.UnixEpoch &&
+            DeserializeSecureItemPayloadSnapshot(existing.PayloadJson, existing.Title, existing.EntryType)?.Item is { } previous)
+        {
+            if (portableItem.BitwardenVaultId is null) portableItem.BitwardenFolderId ??= previous.BitwardenFolderId;
+            portableItem.BitwardenVaultId ??= previous.BitwardenVaultId;
+            portableItem.BitwardenCipherId ??= previous.BitwardenCipherId;
+            portableItem.BitwardenRevisionDate ??= previous.BitwardenRevisionDate;
+        }
         portableItem.ItemData = ToPortableSensitiveValue(portableItem.ItemData);
         var boundPasswordEntryId = await ResolvePasswordEntryIdAsync(vault, item.BoundPasswordId, cancellationToken);
-        var payload = AndroidMdbxPayloadCodec.EncodeSecureItem(
+        var portableAttachments = NormalizeSecureItemAttachments(item.Id, DecodeSecureItemImagePaths(item)).ToList();
+        var payload = RewriteLegacyPayload(existing, "item", portableItem.Id, portableItem,
+            [("attachments", portableAttachments)])
+            ?? AndroidMdbxPayloadCodec.EncodeSecureItem(
             portableItem,
             await PayloadFolderIdAsync(vault, project, cancellationToken),
             boundPasswordEntryId,
-            NormalizeSecureItemAttachments(item.Id, DecodeSecureItemImagePaths(item)).ToList());
+            portableAttachments);
         var record = await SaveEntryAsync(
             vault,
             project.ProjectId,

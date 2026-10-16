@@ -48,6 +48,16 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: ./eng/ci/resolve-version.ps1 -Mode ci
 
+      - name: Test and build Rust LAN transport
+        shell: pwsh
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          cargo test --manifest-path crates/monica-lan-sync/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --manifest-path crates/monica-crypto/Cargo.toml --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./crates/monica-crypto/build.ps1 -Configuration release -RuntimeIdentifier win-x64
+
       - name: Verify commercial release gates
         shell: pwsh
         working-directory: ${{ env.PROJECT_DIR }}

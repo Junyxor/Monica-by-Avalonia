@@ -77,7 +77,19 @@ public sealed record BitwardenMutationResponse(
     string? RemoteRevision,
     int? HttpStatusCode = null,
     string? ErrorMessage = null,
-    TimeSpan? RetryAfter = null);
+    TimeSpan? RetryAfter = null,
+    BitwardenFailureClass? FailureClass = null);
+
+/// <summary>Updates a server binding without writing an old copy of the item's content.</summary>
+public sealed record BitwardenMutationAcknowledgement(
+    bool IsPassword,
+    long LocalId,
+    long VaultId,
+    string? ExpectedCipherId,
+    string CipherId,
+    string? Revision,
+    long? MdbxDatabaseId = null,
+    string? MdbxEntryId = null);
 
 public interface IBitwardenMutationTransport
 {

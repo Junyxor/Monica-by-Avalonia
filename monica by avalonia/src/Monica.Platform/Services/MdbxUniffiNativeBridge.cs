@@ -153,7 +153,7 @@ public sealed partial class MdbxUniffiNativeBridge : IMdbxNativeBridge, IMdbxNat
         }
     }
 
-    private sealed class MdbxUniffiNativeVault(MdbxVault vault) : IMdbxNativeVault, IMdbxNativeObjectReader, IDisposable
+    private sealed partial class MdbxUniffiNativeVault(MdbxVault vault) : IMdbxNativeVault, IMdbxNativeObjectReader, IDisposable
     {
         private const uint ObjectSummaryPageSize = 200;
         private const ulong MaximumObjectPayloadBytes = 4UL * 1024 * 1024;
@@ -404,8 +404,22 @@ public sealed partial class MdbxUniffiNativeBridge : IMdbxNativeBridge, IMdbxNat
                 () =>
                 {
                     RequireEditableObject(entryId, entryType);
-                    Execute(new MdbxWriteCommand.UpdateEntry(entryId, projectId, entryType, title, payloadJson));
-                    return new MdbxNativeEntryRecord(entryId, projectId, entryType, title, payloadJson, Deleted: false);
+                    var deleted = vault.GetObjectSummary(entryId)?.Deleted == true;
+                    var update = new MdbxWriteCommand.UpdateEntry(entryId, projectId, entryType, title, payloadJson);
+                    if (deleted)
+                    {
+                        // The engine rejects a direct update of a trashed entry. Commit the
+                        // temporary restore, payload update and re-delete as one operation so
+                        // metadata maintenance never publishes a revived entry.
+                        vault.ExecuteWriteOperation(Guid.NewGuid().ToString(), EntryWriteOperationKind,
+                        [
+                            new MdbxWriteCommand.RestoreEntry(entryId, projectId),
+                            update,
+                            new MdbxWriteCommand.DeleteEntry(entryId, projectId)
+                        ]);
+                    }
+                    else Execute(update);
+                    return new MdbxNativeEntryRecord(entryId, projectId, entryType, title, payloadJson, Deleted: deleted);
                 },
                 cancellationToken);
 
@@ -472,16 +486,19 @@ public sealed partial class MdbxUniffiNativeBridge : IMdbxNativeBridge, IMdbxNat
             byte[] content,
             CancellationToken cancellationToken = default) =>
             RunBlockingNativeAsync(
-                () => ToAttachment(vault.CreateAttachmentWithContent(
-                    Guid.NewGuid().ToString(),
-                    new MdbxAttachmentCreateRequest(
+                () =>
+                {
+                    var request = new MdbxAttachmentCreateRequest(
                         AttachmentId: Guid.NewGuid().ToString(),
                         ProjectId: projectId,
                         EntryId: entryId,
                         FileName: fileName,
-                        MediaType: string.IsNullOrWhiteSpace(mediaType) ? DefaultMediaType : mediaType),
-                    content,
-                    MdbxFfi.DefaultAttachmentContentLimits()).Attachment),
+                        MediaType: string.IsNullOrWhiteSpace(mediaType) ? DefaultMediaType : mediaType);
+                    var result = content.Length <= 512 * 1024
+                        ? vault.CreateAttachmentWithContent(Guid.NewGuid().ToString(),request,content,MdbxFfi.DefaultAttachmentContentLimits())
+                        : vault.CreateAttachmentWithExternalContent(Guid.NewGuid().ToString(),request,content,MdbxFfi.DefaultAttachmentContentLimits());
+                    return ToAttachment(result.Attachment);
+                },
                 cancellationToken);
 
         public Task<IReadOnlyList<MdbxNativeAttachmentRecord>> ListAttachmentsAsync(
@@ -508,7 +525,7 @@ public sealed partial class MdbxUniffiNativeBridge : IMdbxNativeBridge, IMdbxNat
             new(project.ProjectId, project.Title);
 
         private static MdbxNativeProjectRecord ToProject(MdbxCollectionSummary summary) =>
-            new(summary.CollectionId, summary.Title);
+            new(summary.CollectionId, summary.Title, summary.GroupId, summary.HeadCommitId, summary.Deleted);
 
         private static MdbxNativeObjectSummary ToObjectSummary(MdbxObjectSummary summary) =>
             new(

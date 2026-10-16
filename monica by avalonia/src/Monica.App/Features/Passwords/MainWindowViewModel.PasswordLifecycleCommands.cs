@@ -147,7 +147,7 @@ public sealed partial class MainWindowViewModel
         }
     }
 
-    private async Task DeletePasswordGroupAsync(PasswordEntry entry, IReadOnlyList<PasswordEntry> siblings, bool updateStatus)
+    private async Task DeletePasswordGroupAsync(PasswordEntry entry, IReadOnlyList<PasswordEntry> siblings, bool updateStatus, bool refreshState = true, Action? onDeleted = null)
     {
         foreach (var item in siblings)
         {
@@ -183,12 +183,16 @@ public sealed partial class MainWindowViewModel
             item.ArchivedAt = null;
             TrackPasswordSelection(item);
             DeletedPasswords.Insert(0, item);
+            onDeleted?.Invoke();
         }
 
         RefreshBoundTotpPresentation(siblings);
-        RaisePasswordCountState();
-        RefreshPasswordSelectionStateFromPasswords();
-        InvalidateSecurityAnalysis();
+        if (refreshState)
+        {
+            RaisePasswordCountState();
+            RefreshPasswordSelectionStateFromPasswords();
+            InvalidateSecurityAnalysis();
+        }
         if (updateStatus)
         {
             SetStatusNotice("MovedToRecycleBinFormat", entry.Title);

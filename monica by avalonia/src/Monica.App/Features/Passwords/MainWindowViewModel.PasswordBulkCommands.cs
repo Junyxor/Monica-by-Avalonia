@@ -47,6 +47,7 @@ public sealed partial class MainWindowViewModel
     [RelayCommand]
     private async Task DeleteSelectedPasswordsAsync()
     {
+        if (IsDeletingPasswords) return;
         var selected = Passwords.Where(item => item.IsSelected).ToArray();
         if (selected.Length == 0)
         {
@@ -70,25 +71,33 @@ public sealed partial class MainWindowViewModel
             }
         });
 
-        var handled = new HashSet<long>();
-        foreach (var entry in selected)
+        // Build the replica lookup once. Scanning the shrinking list for every selection is quadratic.
+        var lookup = Passwords.ToLookup(BuildSiblingGroupKey);
+        var groups = selected.Select(BuildSiblingGroupKey).Distinct().Select(key => lookup[key].ToArray()).ToArray();
+        PasswordDeleteProcessed = 0;
+        PasswordDeleteTotal = groups.Sum(group => group.Length);
+        IsDeletingPasswords = true;
+        try
         {
-            if (!handled.Add(entry.Id))
+            foreach (var siblings in groups)
             {
-                continue;
+                await DeletePasswordGroupAsync(siblings[0], siblings, updateStatus: false, refreshState: false,
+                    onDeleted: () => PasswordDeleteProcessed++);
+                await Task.Yield();
             }
-
-            var siblings = GetPasswordSiblings(entry).ToArray();
-            foreach (var sibling in siblings)
-            {
-                handled.Add(sibling.Id);
-            }
-
-            await DeletePasswordGroupAsync(entry, siblings, updateStatus: false);
+            SetStatusNotice("MovedSelectedPasswordsToRecycleBinFormat", selected.Length);
         }
-
-        RefreshPasswordSelectionStateFromPasswords();
-        SetStatusNotice("MovedSelectedPasswordsToRecycleBinFormat", selected.Length);
+        catch (Exception)
+        {
+            SetStatusNotice("PasswordDeleteFailedFormat", PasswordDeleteProcessed, PasswordDeleteTotal);
+        }
+        finally
+        {
+            RaisePasswordCountState();
+            RefreshPasswordSelectionStateFromPasswords();
+            InvalidateSecurityAnalysis();
+            IsDeletingPasswords = false;
+        }
     }
 
     [RelayCommand]

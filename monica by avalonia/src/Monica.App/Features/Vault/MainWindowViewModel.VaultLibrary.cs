@@ -246,7 +246,11 @@ public sealed partial class MainWindowViewModel
 
     // One reset flips eight filter fields, and each write would rebuild the whole tree again; a
     // scope keeps those writes down to the single rebuild its Dispose flushes.
-    private VaultTreeRefreshScope SuppressVaultTreeRefresh() => new(this);
+    private VaultTreeRefreshScope SuppressVaultTreeRefresh()
+    {
+        _vaultTreeRefreshDepth++;
+        return new(this);
+    }
 
     private readonly struct VaultTreeRefreshScope(MainWindowViewModel owner) : IDisposable
     {

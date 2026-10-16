@@ -23,6 +23,7 @@ using Monica.Core.ImportExport;
 using Monica.Core.Models;
 using Monica.Core.Services;
 using Monica.Data;
+using Monica.Data.Mdbx;
 using Monica.Data.Passkeys;
 using Monica.Data.Bitwarden;
 using Monica.Data.Repositories;
@@ -88,7 +89,10 @@ public sealed partial class MainWindowViewModel : ObservableObject
         IBitwardenPurgeQueue? bitwardenPurgeQueue = null,
         IBitwardenStuckEraseService? bitwardenStuckEraseService = null,
         IMdbxUnknownEntryDiagnostics? mdbxUnknownEntryDiagnostics = null,
-        IPasskeyStore? passkeyStore = null)
+        IPasskeyStore? passkeyStore = null,
+        IMdbxLanSyncStore? lanSyncStore = null,
+        IMdbxNativeBridge? lanNativeBridge = null,
+        DeviceSyncCoordinator? deviceSyncCoordinator = null)
     {
         _viewModelDispatcher = Dispatcher.CurrentDispatcher;
         _repository = repository;
@@ -155,6 +159,7 @@ public sealed partial class MainWindowViewModel : ObservableObject
         RefreshChoiceLabels();
         RefreshMdbxHealthItems();
         RefreshSyncHealthItems();
+        InitializeDeviceSync(deviceSyncCoordinator);
     }
 
     public ILocalizationService L => _localization;

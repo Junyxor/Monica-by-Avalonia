@@ -53,6 +53,149 @@ public sealed class BitwardenMutationHttpTransportTests
             request => Assert.Equal(HttpMethod.Put, request.Method));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Update_CarriesTheEditedRevisionSoAServerChangeAfterPreflightIsRejected(bool vaultwardenShape)
+    {
+        const string editedRevision = "2026-10-09T01:00:00Z";
+        const string staleMessage = "The client copy of this cipher is out of date. Resync the client and try again.";
+        var handler = new CaptureHandler(request =>
+        {
+            if (request.Method == HttpMethod.Get)
+                return Json(HttpStatusCode.OK, new { id = "cipher-id", revisionDate = editedRevision });
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            // The remote item changed between GET and PUT. Both reference servers only
+            // perform their stale check when this field accompanies the update.
+            if (body.RootElement.TryGetProperty("lastKnownRevisionDate", out var revision) && revision.GetString() == editedRevision)
+                return vaultwardenShape
+                    ? Json(HttpStatusCode.BadRequest, new { ErrorModel = new { Message = staleMessage }, secret = "must-not-leak" })
+                    : Json(HttpStatusCode.BadRequest, new { error = staleMessage, secret = "must-not-leak" });
+            return Json(HttpStatusCode.OK, new { id = "cipher-id", revisionDate = "2026-10-09T01:00:10Z" });
+        });
+        using var transport = CreateTransport(handler);
+        var response = await transport.SendAsync(Request(BitwardenMutationOperationType.Update, "cipher-id", editedRevision));
+        Assert.False(response.Succeeded);
+        Assert.Equal((int)HttpStatusCode.BadRequest, response.HttpStatusCode);
+        Assert.Equal(BitwardenFailureClass.Conflict, response.FailureClass);
+        Assert.DoesNotContain("must-not-leak", response.ErrorMessage!);
+    }
+
+    [Fact]
+    public async Task Update_UsesQueueRevisionRatherThanAGuardLeftInThePayload()
+    {
+        var handler = new CaptureHandler(request => Json(HttpStatusCode.OK, new { id = "cipher-id", revisionDate = "rev-1" }));
+        using var transport = CreateTransport(handler);
+        const string originalPayload = "{\"type\":1,\"name\":\"encrypted-name\",\"futureField\":{\"keep\":true},\"LastKnownRevisionDate\":\"stale-payload-guard\",\"lastKnownRevisionDate\":\"another-old-guard\"}";
+        var request = Request(BitwardenMutationOperationType.Update, "cipher-id", "rev-1") with
+        {
+            PayloadJson = originalPayload
+        };
+        await transport.SendAsync(request);
+        using var body = JsonDocument.Parse(handler.Requests[1].Body!);
+        Assert.True(body.RootElement.TryGetProperty("lastKnownRevisionDate", out var guard));
+        Assert.Equal("rev-1", guard.GetString());
+        Assert.Equal("encrypted-name", body.RootElement.GetProperty("name").GetString());
+        Assert.True(body.RootElement.GetProperty("futureField").GetProperty("keep").GetBoolean());
+        Assert.False(body.RootElement.TryGetProperty("LastKnownRevisionDate", out _));
+        Assert.Single(body.RootElement.EnumerateObject(), property =>
+            property.Name.Equals("lastKnownRevisionDate", StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(originalPayload, request.PayloadJson);
+    }
+
+    [Fact]
+    public async Task Update_RejectsPayloadThatExceedsTheLimitAfterAddingTheRevision()
+    {
+        const int maximumBytes = 2 * 1024 * 1024;
+        var handler = new CaptureHandler(_ => throw new InvalidOperationException("No request should leave the device."));
+        using var transport = CreateTransport(handler);
+        var request = Request(BitwardenMutationOperationType.Update, "cipher-id", "rev-1") with
+        {
+            PayloadJson = "{\"name\":\"" + new string('a', maximumBytes - 11) + "\"}"
+        };
+        Assert.Equal(maximumBytes, Encoding.UTF8.GetByteCount(request.PayloadJson));
+
+        await Assert.ThrowsAsync<BitwardenProtocolException>(() => transport.SendAsync(request));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public async Task Update_RejectsAMissingRevisionBeforeSending(string? revision)
+    {
+        var handler = new CaptureHandler(_ => throw new InvalidOperationException("No request should leave the device."));
+        using var transport = CreateTransport(handler);
+
+        await Assert.ThrowsAsync<BitwardenProtocolException>(() => transport.SendAsync(
+            Request(BitwardenMutationOperationType.Update, "cipher-id", revision)));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Update_RejectsAnOversizedRevisionBeforeSending()
+    {
+        var handler = new CaptureHandler(_ => throw new InvalidOperationException("No request should leave the device."));
+        using var transport = CreateTransport(handler);
+
+        await Assert.ThrowsAsync<BitwardenProtocolException>(() => transport.SendAsync(
+            Request(BitwardenMutationOperationType.Update, "cipher-id", new string('r', 129))));
+
+        Assert.Empty(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("{\"error\":\"must-not-leak\"}")]
+    [InlineData("{\"error\":{\"detail\":\"must-not-leak\"}}")]
+    [InlineData("{\"ErrorModel\":{\"Message\":\"Invalid cipher type: must-not-leak\"}}")]
+    [InlineData("{\"ErrorModel\":{\"Message\":\"The client copy of this cipher is out of date. Resync the client and try again. must-not-leak\"}}")]
+    [InlineData("{\"unrelatedField\":\"The client copy of this cipher is out of date. Resync the client and try again.\"}")]
+    [InlineData("must-not-leak")]
+    [InlineData("[]")]
+    public async Task Update_OtherBadRequestsKeepTheirValidationSemantics(string errorBody)
+    {
+        var handler = new CaptureHandler(request => request.Method == HttpMethod.Get
+            ? Json(HttpStatusCode.OK, new { id = "cipher-id", revisionDate = "rev-1" })
+            : new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent(errorBody, Encoding.UTF8, "application/json")
+            });
+        using var transport = CreateTransport(handler);
+
+        var response = await transport.SendAsync(Request(BitwardenMutationOperationType.Update, "cipher-id", "rev-1"));
+
+        Assert.False(response.Succeeded);
+        Assert.Equal((int)HttpStatusCode.BadRequest, response.HttpStatusCode);
+        Assert.Null(response.FailureClass);
+        Assert.Equal("Bitwarden mutation failed with HTTP 400.", response.ErrorMessage);
+    }
+
+    [Theory]
+    [InlineData(BitwardenMutationOperationType.Create, HttpStatusCode.BadRequest, false)]
+    [InlineData(BitwardenMutationOperationType.SoftDelete, HttpStatusCode.BadRequest, false)]
+    [InlineData(BitwardenMutationOperationType.Update, HttpStatusCode.BadRequest, true)]
+    [InlineData(BitwardenMutationOperationType.Update, HttpStatusCode.ServiceUnavailable, false)]
+    public async Task StaleTextOnlyClassifiesAnUpdateBadRequestAsAConflict(
+        BitwardenMutationOperationType operation,
+        HttpStatusCode status,
+        bool failsPreflight)
+    {
+        var handler = new CaptureHandler(request => request.Method == HttpMethod.Get && !failsPreflight
+            ? Json(HttpStatusCode.OK, new { id = "cipher-id", revisionDate = "rev-1" })
+            : Json(status, new { error = "The client copy of this cipher is out of date. Resync the client and try again." }));
+        using var transport = CreateTransport(handler);
+
+        var response = await transport.SendAsync(Request(
+            operation, "cipher-id", operation == BitwardenMutationOperationType.Create ? null : "rev-1"));
+
+        Assert.False(response.Succeeded);
+        Assert.Equal((int)status, response.HttpStatusCode);
+        Assert.Null(response.FailureClass);
+    }
+
     [Fact]
     public async Task Update_StopsWhenRemoteRevisionChanged()
     {

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -19,6 +20,11 @@ public sealed class BitwardenMutationTransportFactory(
 internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTransport
 {
     private const int MaximumMutationBytes = 2 * 1024 * 1024;
+    private const int MaximumRevisionLength = 128;
+    private const string RevisionConflictMessage =
+        "The remote Bitwarden item changed before this mutation could be applied.";
+    private const string ServerStaleRevisionMessage =
+        "The client copy of this cipher is out of date. Resync the client and try again.";
     private readonly BitwardenAccount _account;
     private readonly HttpClient _client;
     private byte[]? _accessToken;
@@ -58,7 +64,7 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
             throw new BitwardenProtocolException("Bitwarden mutation transport does not match the active vault.");
         }
 
-        ValidatePayload(request);
+        var payload = PreparePayload(request);
         if (request.OperationType is BitwardenMutationOperationType.Update
                 or BitwardenMutationOperationType.Delete
                 or BitwardenMutationOperationType.SoftDelete
@@ -77,7 +83,7 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
                     request.CipherId,
                     preflight.Revision,
                     (int)HttpStatusCode.Conflict,
-                    "The remote Bitwarden item changed before this mutation could be applied.");
+                    RevisionConflictMessage);
             }
         }
 
@@ -102,7 +108,7 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
         using var message = CreateRequest(method, uri, request.IdempotencyKey);
         if (!WritesNoBody(request.OperationType))
         {
-            message.Content = new StringContent(request.PayloadJson, Encoding.UTF8, "application/json");
+            message.Content = new StringContent(payload, Encoding.UTF8, "application/json");
         }
 
         using var response = await _client.SendAsync(
@@ -154,7 +160,14 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
         var payload = await BitwardenHttpContent.ReadLimitedAsync(response, MaximumMutationBytes, cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
-            return Failure(response);
+            var failure = Failure(response);
+            // These servers report a stale cipher as HTTP 400, alongside ordinary validation
+            // errors. Keep the actual status while giving the queue the conflict semantics.
+            return request.OperationType == BitwardenMutationOperationType.Update &&
+                   response.StatusCode == HttpStatusCode.BadRequest &&
+                   IsStaleRevisionResponse(payload)
+                ? failure with { ErrorMessage = RevisionConflictMessage, FailureClass = BitwardenFailureClass.Conflict }
+                : failure;
         }
 
         if (!ReadsCipherResponse(request.OperationType))
@@ -192,6 +205,50 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
         $"Bitwarden mutation failed with HTTP {(int)response.StatusCode}.",
         ReadRetryAfter(response));
 
+    private static bool IsStaleRevisionResponse(byte[] payload)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(payload);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (property.Name.Equals("error", StringComparison.OrdinalIgnoreCase) &&
+                    IsStaleRevisionMessage(property.Value))
+                {
+                    return true;
+                }
+
+                if (property.Name.Equals("errorModel", StringComparison.OrdinalIgnoreCase) &&
+                    property.Value.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var detail in property.Value.EnumerateObject())
+                    {
+                        if (detail.Name.Equals("message", StringComparison.OrdinalIgnoreCase) &&
+                            IsStaleRevisionMessage(detail.Value))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // Invalid error JSON still receives the sanitized HTTP failure. Never return
+            // server-provided text, which can contain details from the encrypted item.
+        }
+
+        return false;
+    }
+
+    private static bool IsStaleRevisionMessage(JsonElement value) =>
+        value.ValueKind == JsonValueKind.String && value.ValueEquals(ServerStaleRevisionMessage);
+
     private static TimeSpan? ReadRetryAfter(HttpResponseMessage response)
     {
         var retry = response.Headers.RetryAfter;
@@ -205,27 +262,65 @@ internal sealed class BitwardenMutationHttpTransport : IBitwardenOwnedMutationTr
             : null;
     }
 
-    private static void ValidatePayload(BitwardenMutationRequest request)
+    private static string PreparePayload(BitwardenMutationRequest request)
     {
         if (Encoding.UTF8.GetByteCount(request.PayloadJson) > MaximumMutationBytes)
         {
             throw new BitwardenProtocolException("Bitwarden mutation payload exceeds the supported size.");
         }
 
-        if (!WritesNoBody(request.OperationType))
+        if (WritesNoBody(request.OperationType))
         {
-            try
+            return request.PayloadJson;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(request.PayloadJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
-                using var document = JsonDocument.Parse(request.PayloadJson);
-                if (document.RootElement.ValueKind != JsonValueKind.Object)
+                throw new BitwardenProtocolException("Bitwarden mutation payload must be a JSON object.");
+            }
+
+            if (request.OperationType != BitwardenMutationOperationType.Update)
+            {
+                return request.PayloadJson;
+            }
+
+            if (string.IsNullOrWhiteSpace(request.ExpectedRemoteRevision) ||
+                request.ExpectedRemoteRevision.Length > MaximumRevisionLength)
+            {
+                throw new BitwardenProtocolException("Bitwarden update revision is missing or invalid.");
+            }
+
+            var buffer = new ArrayBufferWriter<byte>();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                foreach (var property in document.RootElement.EnumerateObject())
                 {
-                    throw new BitwardenProtocolException("Bitwarden mutation payload must be a JSON object.");
+                    if (!property.Name.Equals("lastKnownRevisionDate", StringComparison.OrdinalIgnoreCase))
+                    {
+                        property.WriteTo(writer);
+                    }
                 }
+
+                // Use the revision on which the local edit was based, never a guard left in
+                // the payload or a newer preflight revision. Preserve all encrypted fields.
+                writer.WriteString("lastKnownRevisionDate", request.ExpectedRemoteRevision);
+                writer.WriteEndObject();
             }
-            catch (JsonException exception)
+
+            if (buffer.WrittenCount > MaximumMutationBytes)
             {
-                throw new BitwardenProtocolException("Bitwarden mutation payload is malformed.", exception);
+                throw new BitwardenProtocolException("Bitwarden mutation payload exceeds the supported size.");
             }
+
+            return Encoding.UTF8.GetString(buffer.WrittenSpan);
+        }
+        catch (JsonException exception)
+        {
+            throw new BitwardenProtocolException("Bitwarden mutation payload is malformed.", exception);
         }
     }
 

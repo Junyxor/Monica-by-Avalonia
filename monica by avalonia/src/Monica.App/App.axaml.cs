@@ -42,6 +42,7 @@ public partial class App : Application
             _services = ConfigureServices(_mainWindow);
             var viewModel = _services.GetRequiredService<MainWindowViewModel>();
             _mainWindow.DataContext = viewModel;
+            _services.GetRequiredService<DeviceSyncCoordinator>().Start();
             var desktopIntegration = _services.GetRequiredService<DesktopIntegrationCoordinator>();
             desktopIntegration.Initialize(viewModel);
             _mainWindow.ShutdownRequestedAsync = () => EnsureShutdownAsync(viewModel);
@@ -200,6 +201,7 @@ public partial class App : Application
         services.AddSingleton<IMdbxNativeBridge, MdbxUniffiNativeBridge>();
         services.AddSingleton<MdbxVaultStore>();
         services.AddSingleton<IMdbxVaultStore>(provider => provider.GetRequiredService<MdbxVaultStore>());
+        services.AddSingleton<IMdbxLanSyncStore>(provider => provider.GetRequiredService<MdbxVaultStore>());
         services.AddSingleton<IMdbxVaultFileReplacementCoordinator>(provider => provider.GetRequiredService<MdbxVaultStore>());
         services.AddSingleton<MdbxBackedMonicaRepository>(provider => new MdbxBackedMonicaRepository(
             provider.GetRequiredService<MonicaRepository>(),
@@ -210,6 +212,10 @@ public partial class App : Application
         services.AddSingleton<IMasterPasswordMaintenanceService, MasterPasswordMaintenanceService>();
         services.AddSingleton<ICryptoService, CryptoService>();
         services.AddSingleton<IVaultSessionService, VaultSessionService>();
+        services.AddSingleton<DeviceSyncPreferenceStore>();
+        services.AddSingleton<IDeviceSyncDataProvider, DevicePasswordSyncProvider>();
+        services.AddSingleton<IDeviceSyncTransport, NativeDeviceSyncTransport>();
+        services.AddSingleton<DeviceSyncCoordinator>();
         services.AddSingleton<IBitwardenAccountStore, BitwardenAccountStore>();
         services.AddSingleton<IBitwardenRemoteFolderStore, BitwardenRemoteFolderStore>();
         services.AddSingleton<IBitwardenConflictBackupStore, BitwardenConflictBackupStore>();

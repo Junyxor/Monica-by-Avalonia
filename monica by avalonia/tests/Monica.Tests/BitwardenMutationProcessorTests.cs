@@ -11,6 +11,30 @@ namespace Monica.Tests;
 public sealed class BitwardenMutationProcessorTests
 {
     [Fact]
+    public async Task Worker_revision_rejection_keeps_the_local_edit_and_marks_a_conflict()
+    {
+        var harness = await CreateHarnessAsync();
+        var entry = await SavePasswordAsync(harness, "cipher-worker-conflict", "Local edit");
+        var now = DateTimeOffset.UtcNow;
+        await harness.OperationStore.EnqueueAsync(Operation(harness.VaultId, entry, now));
+        var transport = new ScriptedTransport(_ => new BitwardenMutationResponse(
+            false, entry.BitwardenCipherId, null, 400, "Remote revision changed", FailureClass: BitwardenFailureClass.Conflict));
+        var result = await harness.Processor.ProcessReadyAsync(harness.VaultId, now, transport);
+        Assert.Equal(1, result.Conflicts);
+        Assert.Equal(0, result.Failed);
+        var pending = Assert.Single(await harness.OperationStore.GetAsync(harness.VaultId));
+        Assert.Equal(BitwardenMutationStatus.Conflict, pending.Status);
+        Assert.Equal(BitwardenFailureClass.Conflict, pending.LastFailureClass);
+        var retained = Assert.Single(await harness.Repository.GetPasswordsAsync());
+        Assert.True(retained.BitwardenLocalModified);
+        Assert.Equal(entry.Title, retained.Title);
+        Assert.Equal(entry.BitwardenRevisionDate, retained.BitwardenRevisionDate);
+        var retry = await harness.Processor.ProcessReadyAsync(harness.VaultId, now.AddMinutes(10), transport);
+        Assert.Equal(0, retry.Claimed);
+        Assert.Equal(1, transport.RequestCount);
+    }
+
+    [Fact]
     public async Task ProcessorCompletesAndDefersOperationsWithoutDuplicateClaims()
     {
         var harness = await CreateHarnessAsync();

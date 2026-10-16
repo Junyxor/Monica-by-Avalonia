@@ -31,6 +31,7 @@ public sealed partial class MainWindowViewModel
         {
             "backup" or "backups" or "history" => "Backup",
             "sources" or "vaults" or "database" => "Sources",
+            "devices" or "nearby" => "Devices",
             "import" => "Import",
             "export" => "Export",
             _ => "Configuration"

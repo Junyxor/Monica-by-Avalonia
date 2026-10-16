@@ -229,7 +229,7 @@ public sealed partial class MdbxBackedMonicaRepository(
         var categories = await EnsureMdbxCategoriesAsync(database, cancellationToken);
         var snapshot = await GetPasswordReadSnapshotAsync(database, categories, cancellationToken);
         var existingIds = snapshot.Passwords
-            .Where(entry => !entry.IsDeleted)
+            .Where(entry => entry.DeletedAt != DateTimeOffset.UnixEpoch)
             .Select(entry => entry.Id)
             .ToHashSet();
         ids = ids.Where(existingIds.Contains).ToArray();
@@ -486,7 +486,7 @@ public sealed partial class MdbxBackedMonicaRepository(
 
         var categories = await EnsureMdbxCategoriesAsync(database, cancellationToken);
         var existing = (await GetPasswordReadSnapshotAsync(database, categories, cancellationToken)).Passwords
-            .Any(entry => entry.Id == entryId && !entry.IsDeleted);
+            .Any(entry => entry.Id == entryId && entry.DeletedAt != DateTimeOffset.UnixEpoch);
         if (!existing)
         {
             return [];
